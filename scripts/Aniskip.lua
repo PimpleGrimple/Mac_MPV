@@ -28,12 +28,21 @@ local categories = {
 -- Converts a plain "RRGGBB" hex string to ASS's "BBGGRR" order. Falls back to
 -- the default violet if the option is missing/malformed.
 local function hex_to_ass_bgr(hex)
-    hex = (hex or ""):gsub("^#", "")
+    hex = (hex or ""):gsub("^[#!]", "")
     if not hex:match("^%x%x%x%x%x%x$") then return "FA8BA7" end
     return hex:sub(5, 6) .. hex:sub(3, 4) .. hex:sub(1, 2)
 end
 
 local ACCENT_COLOR = hex_to_ass_bgr(opts.accent_color)
+
+local function update_options()
+    read_options(opts, "skip_intro")
+    ACCENT_COLOR = hex_to_ass_bgr(opts.accent_color)
+end
+
+-- Watch script-opts for runtime updates when styles change
+mp.observe_property("user-data/script-opts", "native", update_options)
+mp.observe_property("script-opts", "string", update_options)
 
 -- Button geometry: minimal pill, flush against the top-left screen edge
 local SCREEN_W, SCREEN_H = 1920, 1080
@@ -179,7 +188,7 @@ local function draw_panel(x, bg_alpha, scale)
         x, BTN_Y, scale, scale, bg_alpha, rounded_rect_left(PANEL_W, BTN_H, BTN_R))
 end
 
--- Violet accent strip: the end-cap of the pill, flat on the left (against the
+-- Accent strip: the end-cap of the pill, flat on the left (against the
 -- panel), rounded on the right. Slides as one rigid piece with the panel, so
 -- when the panel exits off-screen the accent is what's left sitting flush
 -- against the edge.
@@ -257,9 +266,6 @@ local function skip_action()
     end)
 end
 
--- True when the mouse is near the button's corner (covers both the collapsed tab
--- and the expanded pill, plus a little breathing room so it feels responsive) -
--- used only to decide whether to expand, never to arm the click-to-skip binding
 local function is_hovering_near()
     local mx, my = mp.get_mouse_pos()
     local osd_w, osd_h = mp.get_osd_size()
@@ -268,10 +274,6 @@ local function is_hovering_near()
     return tx < BTN_X + BTN_W + HOVER_PAD_X and ty < BTN_Y + BTN_H + HOVER_PAD_Y
 end
 
--- True only when the cursor is actually over the button's real pixels (fully
--- expanded position). This gates whether a click counts as "click the button" -
--- is_hovering_near() above is deliberately loose (for early expansion) and must
--- never be used to decide whether a click should skip.
 local function is_over_button()
     local mx, my = mp.get_mouse_pos()
     local osd_w, osd_h = mp.get_osd_size()
@@ -294,8 +296,6 @@ local function on_tick()
     if not opts.enabled or not current_file_enabled or state.is_skipping then return end
     local time = mp.get_property_number("time-pos")
 
-    -- track real elapsed time (not playback time) so the slide animates smoothly
-    -- regardless of playback speed/pause
     local now = mp.get_time()
     local dt = state.last_wall and math.min(now - state.last_wall, 0.5) or 0
     state.last_wall = now
@@ -337,8 +337,6 @@ local function on_tick()
             end
 
             draw_button(active.label, math.ceil(active.end_time - time), hovering, state.progress)
-            -- only clickable while fully expanded AND the cursor is actually over the
-            -- button's real pixels - not just "somewhere on screen while it's expanded"
             set_mouse_bound(state.progress >= 0.999 and is_over_button())
 
             if not state.key_bound then
@@ -353,7 +351,6 @@ local function on_tick()
     end
 end
 
--- Apply the updated chapter list directly to mpv in-memory (updates seekbar ticks instantly)
 local function apply_chapters_to_mpv()
     if #state.intervals == 0 then return end
     table.sort(state.intervals, function(a, b) return a.start_time < b.start_time end)
@@ -389,14 +386,13 @@ local function parse_local_chapters()
 end
 
 local function initialize_skipper()
-    read_options(opts, "skip_intro")
+    update_options()
     state.initialized = false
     if not opts.enabled then return end
     state.initialized = true
 
     parse_ignored_patterns()
     parse_skip_categories()
-    ACCENT_COLOR = hex_to_ass_bgr(opts.accent_color)
 
     state.intervals, state.active_interval, state.is_skipping = {}, nil, false
     current_file_enabled = true
@@ -507,7 +503,6 @@ mp.register_script_message("toggle-state", function(val)
     set_enabled(val == "true")
 end)
 
--- manual on/off toggle, e.g. for files you don't want it running on
 mp.add_key_binding(opts.toggle_key, "skip-intro-toggle", function()
     set_enabled(not opts.enabled)
 end)

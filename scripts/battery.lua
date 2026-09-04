@@ -38,7 +38,7 @@ local function toggle()
 end
 
 check()
-mp.add_periodic_timer(20, check)
+mp.add_periodic_timer(30, check)
 mp.register_event("file-loaded", check)
 mp.register_event("playback-restart", apply)
 

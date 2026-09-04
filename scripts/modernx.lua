@@ -305,7 +305,7 @@ local icons = {
 
     download = "\239\133\144",
     download_initiated = "\239\140\174",
-    download_done = "\239\137\169",
+    download_done = "\239\137\171",
 
     loop_off = "\239\133\178",
     loop_on = "\239\133\181",
@@ -433,10 +433,12 @@ end
 local playpause_size = user_opts.playpause_size or 30
 local midbuttons_size = user_opts.midbuttons_size or 24
 local sidebuttons_size = user_opts.sidebuttons_size or 24
-local osc_styles = {
-    osc_fade_bg = "{\\blur" ..
-        user_opts.fade_blur_strength ..
-        "\\bord" .. user_opts.fade_alpha .. "\\1c&H0&\\3c&H" .. osc_color_convert(user_opts.osc_color) .. "&}",
+local osc_styles = {}
+local function update_osc_styles()
+    osc_styles = {
+        osc_fade_bg = "{\\blur" ..
+            user_opts.fade_blur_strength ..
+            "\\bord" .. user_opts.fade_alpha .. "\\1c&H0&\\3c&H" .. osc_color_convert(user_opts.osc_color) .. "&}",
     window_fade_bg = "{\\blur" ..
         user_opts.window_fade_blur_strength ..
         "\\bord" .. user_opts.window_fade_alpha .. "\\1c&H0&\\3c&H" .. osc_color_convert(user_opts.osc_color) .. "&}",
@@ -483,6 +485,8 @@ local osc_styles = {
     description = '{\\blur1\\bord0.5\\1c&HFFFFFF&\\3c&H000000&\\fs' ..
         user_opts.description_font_size .. '\\q2\\fn' .. user_opts.font .. '}',
 }
+end
+update_osc_styles()
 
 ---@class mp.Timer
 ---@field oneshot boolean
@@ -2166,7 +2170,7 @@ local function download_done(success, _, error)
         end
     else
         show_message("{\\an9}Download failed - " .. (error or "Unknown error"))
-        print("Web video download failed")
+        print("Web video download failed: " .. tostring(error or "Unknown error"))
         state.download_detached = false
     end
     state.downloading = false
@@ -2723,15 +2727,15 @@ function render_message(ass)
 
         local fontsize = tonumber(mp.get_property('options/osd-font-size'))
         local outline = tonumber(mp.get_property('options/osd-border-size'))
-        local maxlines = math.ceil(osc_param.unscaled_y * 0.75 / fontsize)
-        local counterscale = osc_param.playresy / osc_param.unscaled_y
+        local counterscale = osc_param.playresy / 720
+        local maxlines = math.ceil(osc_param.playresy * 0.75 / (fontsize * counterscale))
 
         if state.showingDescription then
-            fontsize = fontsize * 0.85
-            outline = outline * 0.85
+            fontsize = (fontsize * counterscale) * 0.85
+            outline = (outline * counterscale) * 0.85
         else
-            fontsize = fontsize * counterscale / math.max(0.5 + math.min(lines / maxlines, 1), 1)
-            outline = outline * counterscale / math.max(0.5 + math.min(lines / maxlines, 1) / 2, 1)
+            fontsize = (fontsize * counterscale) / math.max(0.5 + math.min(lines / maxlines, 1), 1)
+            outline = (outline * counterscale) / math.max(0.5 + math.min(lines / maxlines, 1) / 2, 1)
         end
 
         if state.showingDescription then
@@ -3505,6 +3509,7 @@ end
 
 -- Validate string type user options
 function validate_user_opts()
+    update_osc_styles()
     if user_opts.window_top_bar ~= "auto" and
         user_opts.window_top_bar ~= "yes" and
         user_opts.window_top_bar ~= "no" then

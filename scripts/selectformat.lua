@@ -96,10 +96,21 @@ local opts = {
     -- Menu position and style
 	menu_pos_x = 20,
 	menu_pos_y = 20,
-	ass_style = "{\\q2\\fnSF Mono\\fnCourier New\\fnmonospace\\fs11\\1c&Hffe6f0&\\3c&H1a0812&\\bord2.5\\shad0\\1a&H00&\\3a&H00&}",
 	curtain_opacity = 0.7,
 	menu_timeout = 6,
+    
+    -- Dynamic Colors (HEX without # or &H)
+    font = "SF Mono",
+    color_header = "ffbad4",
+    color_header_sep = "4d1b2e",
+    color_cursor = "e55d9b",
+    color_cursor_text = "ffe6f0",
+    color_selected = "ff82a6",
+    color_selected_text = "ffe6f0",
+    color_normal = "6c5a75",
+    color_normal_text = "99808f",
 }
+mp.options.read_options(opts, "selectformat")
 mp.options.read_options(opts)
 
 -- ====================
@@ -303,6 +314,7 @@ end
 
 -- show/hide the menu
 function menu_toggle()
+    mp.options.read_options(opts, "selectformat")
 	if not update_url() then
 		mp.osd_message("Formats are only fetched for internet videos.")
 		return
@@ -391,12 +403,12 @@ function menu_draw()
 	)
 
 	ass:pos(opts.menu_pos_x, opts.menu_pos_y)
-	ass:append(opts.ass_style)
+    local ass_style = string.format("{\q2\fn%s\fnCourier New\fnmonospace\fs11\1c&Hffe6f0&\3c&H1a0812&\bord2.5\shad0\1a&H00&\3a&H00&}", opts.font)
+	ass:append(ass_style)
 	
-	-- Header: Soft lavender violet (BGR: &Hffbad4& -> RGB #d4baff, matching ModernX buttons)
 	ass:append(
-		"{\\1c&Hffbad4&\\b1}" .. opts.prefix_header .. header .. "{\\b0}\\N" ..
-		"{\\1c&H4d1b2e&}" .. header_separator .. "\\N"
+		"{\1c&H" .. opts.color_header .. "&\b1}" .. opts.prefix_header .. header .. "{\b0}\N" ..
+		"{\1c&H" .. opts.color_header_sep .. "&}" .. header_separator .. "\N"
 	)
 
 	for idx, fmt in ipairs(data[url].formats) do
@@ -411,17 +423,14 @@ function menu_draw()
 		local line = ""
 
 		if idx == get_cursor_pos() then
-			-- Hovered cursor line: Soft off-white violet text, vibrant violet indicator (BGR: &He55d9b& -> RGB #9b5de5, matching seekbar)
-			line = "{\\1c&He55d9b&\\b1}" .. prefix .. "{\\1c&Hffe6f0&}" .. indent_marker .. label .. "{\\b0}"
+			line = "{\1c&H" .. opts.color_cursor .. "&\b1}" .. prefix .. "{\1c&H" .. opts.color_cursor_text .. "&}" .. indent_marker .. label .. "{\b0}"
 		elseif idx == get_selected_pos() or (not fmt.is_unfolded and idx == get_parent_of_selected_pos()) then
-			-- Selected quality line: Medium lavender violet (BGR: &Hff82a6& -> RGB #a682ff)
-			line = "{\\1c&Hff82a6&}" .. prefix .. "{\\1c&Hffe6f0&}" .. indent_marker .. label
+			line = "{\1c&H" .. opts.color_selected .. "&}" .. prefix .. "{\1c&H" .. opts.color_selected_text .. "&}" .. indent_marker .. label
 		else
-			-- Clean muted lavender-gray for normal lines (BGR: &H99808f& -> RGB #8f8099)
-			line = "{\\1c&H6c5a75&}" .. prefix .. "{\\1c&H99808f&}" .. indent_marker .. label
+			line = "{\1c&H" .. opts.color_normal .. "&}" .. prefix .. "{\1c&H" .. opts.color_normal_text .. "&}" .. indent_marker .. label
 		end
 		
-		ass:append(line .. "\\N")
+		ass:append(line .. "\N")
 	end
 
 	mp.set_osd_ass(0, 0, ass.text)

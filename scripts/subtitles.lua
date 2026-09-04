@@ -50,8 +50,8 @@ local options = {
     -- === lyrics (from autolyrics.lua) ===
     musixmatch_token = "2501192ac605cc2e16b6b2c04fe43d1011a38d919fe802976084e7",
     lyrics_download_for_all = false,    -- try to get lyrics for music without metadata
-    lyrics_load_for_youtube = true,     -- try to load lyrics on youtube videos
-    lyrics_store_separate = true,       -- store lyrics in lyrics_store instead of next to the file
+    lyrics_load_for_youtube = false,     -- try to load lyrics on youtube videos
+    lyrics_store_separate = false,       -- store lyrics in lyrics_store instead of next to the file
     lyrics_store = "~~/cache/scripts/lyrics/",
     lyrics_strip_artists = true,        -- remove lines with artist names from NetEase lyrics
     lyrics_cache_loading = true,        -- try to load lyrics that were already downloaded

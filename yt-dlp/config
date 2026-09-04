@@ -1,31 +1,15 @@
-# ==============================================================================
-# yt-dlp Configuration
-# ==============================================================================
 
-# Authentication & Account
+--extractor-args "youtubepot-wpc:browser_path=/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta"
 --cookies "~/.config/mpv/cache/scripts/cookies.txt"
---mark-watched
-
-# Network & Performance Optimization
+--impersonate chrome
 --force-ipv4
 --retries 10
 --fragment-retries 10
 --socket-timeout 30
 --concurrent-fragments 4
-
-# Proof of Origin (PO-Token) Provider for YouTube Anti-Bot Bypass
-# Default: Google Chrome (standard)
---extractor-args "youtubepot-wpc:browser_path=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-
-# Alternative Browser Paths for macOS (uncomment your preferred browser):
-# Brave:     --extractor-args "youtubepot-wpc:browser_path=/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
-# Edge:      --extractor-args "youtubepot-wpc:browser_path=/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-# Firefox:   --extractor-args "youtubepot-wpc:browser_path=/Applications/Firefox.app/Contents/MacOS/firefox"
-# Chromium:  --extractor-args "youtubepot-wpc:browser_path=/Applications/Chromium.app/Contents/MacOS/Chromium"
-
-# Subtitles, Metadata & Embeds (for standalone CLI downloads)
 --embed-thumbnail
 --embed-metadata
 --embed-subs
 --sub-langs "en.*,-live_chat"
 --no-write-comments
+--mark-watched
