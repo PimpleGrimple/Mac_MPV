@@ -188,7 +188,8 @@ local function render_menu()
 
     local ass = assdraw.ass_new()
     local active_idx = state.profile_idx
-    local accent_color = "&H" .. CONFIG.accent_color .. "&"
+    local function get_color(c) return "&H" .. (tostring(c) or ""):gsub("^[#!]", "") .. "&" end
+    local accent_color = get_color(CONFIG.accent_color)
 
     local card_w = 460
     local visible_count = 9
@@ -202,7 +203,7 @@ local function render_menu()
     -- Card Background
     ass:new_event()
     ass:pos(card_x, card_y)
-    ass:append(string.format("{\\bord1.5\\3c%s\\3a%s\\1c%s\\1a%s\\shad%d\\blur%d\\4a&HFF&}", "&H"..CONFIG.border_color.."&", "&H"..CONFIG.border_alpha.."&", "&H"..CONFIG.bg_color.."&", "&H"..CONFIG.bg_alpha.."&", CONFIG.bg_shadow, CONFIG.bg_blur))
+    ass:append(string.format("{\\bord1.5\\3c%s\\3a%s\\1c%s\\1a%s\\shad%d\\blur%d\\4a&HFF&}", get_color(CONFIG.border_color), get_color(CONFIG.border_alpha), get_color(CONFIG.bg_color), get_color(CONFIG.bg_alpha), CONFIG.bg_shadow, CONFIG.bg_blur))
     ass:draw_start()
     ass:round_rect_cw(0, 0, card_w, card_h, 12)
     ass:draw_stop()
@@ -228,7 +229,7 @@ local function render_menu()
         if is_cursor then
             ass:new_event()
             ass:pos(card_x + 15, cy)
-            ass:append(string.format("{\\bord1\\3c%s\\3a&H40&\\1c%s\\1a&H88&\\shad0\\blur0\\4a&HFF&}", accent_color, "&H"..CONFIG.bg_color.."&"))
+            ass:append(string.format("{\\bord1\\3c%s\\3a&H40&\\1c%s\\1a&H88&\\shad0\\blur0\\4a&HFF&}", accent_color, get_color(CONFIG.bg_color)))
             ass:draw_start()
             ass:round_rect_cw(0, 0, row_w, pill_h, 8)
             ass:draw_stop()

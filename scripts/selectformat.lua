@@ -212,7 +212,7 @@ local menu_timer = nil
 function main()
 	mp.register_event("file-loaded", formats_fetch)
 	mp.register_event("end-file", menu_hide)
-	mp.add_key_binding(nil, "menu", menu_toggle)
+	mp.add_key_binding("y", "menu", menu_toggle)
 end
 
 -- fetch the formats using youtube-dl asyncronously and hand them to formats_save()
@@ -389,7 +389,7 @@ function menu_draw()
 	if opts.curtain_opacity > 0 then
 		local w, h = mp.get_osd_size()
 		local alpha = 255 - math.ceil(255 * opts.curtain_opacity)
-		ass.text = string.format('{\\pos(0,0)\\rDefault\\an7\\1c&H000000&\\alpha&H%X&}', alpha)
+		ass.text = string.format('{\\pos(0,0)\\rDefault\\an7\\1c&H000000&\\3c&H000000&\\4c&H000000&\\bord0\\shad0\\alpha&H%X&}', alpha)
 		ass:draw_start()
 		ass:rect_cw(0, 0, w, h)
 		ass:draw_stop()
@@ -403,12 +403,12 @@ function menu_draw()
 	)
 
 	ass:pos(opts.menu_pos_x, opts.menu_pos_y)
-    local ass_style = string.format("{\q2\fn%s\fnCourier New\fnmonospace\fs11\1c&Hffe6f0&\3c&H1a0812&\bord2.5\shad0\1a&H00&\3a&H00&}", opts.font)
+    local ass_style = string.format("{\\q2\\fn%s\\fnCourier New\\fnmonospace\\fs11\\1c&Hffe6f0&\\3c&H1a0812&\\bord2.5\\shad0\\1a&H00&\\3a&H00&}", opts.font)
 	ass:append(ass_style)
 	
 	ass:append(
-		"{\1c&H" .. opts.color_header .. "&\b1}" .. opts.prefix_header .. header .. "{\b0}\N" ..
-		"{\1c&H" .. opts.color_header_sep .. "&}" .. header_separator .. "\N"
+		"{\\1c&H" .. (opts.color_header or ""):gsub("^[#!]", "") .. "&\\b1}" .. opts.prefix_header .. header .. "{\\b0}\\N" ..
+		"{\\1c&H" .. (opts.color_header_sep or ""):gsub("^[#!]", "") .. "&}" .. header_separator .. "\\N"
 	)
 
 	for idx, fmt in ipairs(data[url].formats) do
@@ -423,14 +423,14 @@ function menu_draw()
 		local line = ""
 
 		if idx == get_cursor_pos() then
-			line = "{\1c&H" .. opts.color_cursor .. "&\b1}" .. prefix .. "{\1c&H" .. opts.color_cursor_text .. "&}" .. indent_marker .. label .. "{\b0}"
+			line = "{\\1c&H" .. (opts.color_cursor or ""):gsub("^[#!]", "") .. "&\\b1}" .. prefix .. "{\\1c&H" .. (opts.color_cursor_text or ""):gsub("^[#!]", "") .. "&}" .. indent_marker .. label .. "{\\b0}"
 		elseif idx == get_selected_pos() or (not fmt.is_unfolded and idx == get_parent_of_selected_pos()) then
-			line = "{\1c&H" .. opts.color_selected .. "&}" .. prefix .. "{\1c&H" .. opts.color_selected_text .. "&}" .. indent_marker .. label
+			line = "{\\1c&H" .. (opts.color_selected or ""):gsub("^[#!]", "") .. "&}" .. prefix .. "{\\1c&H" .. (opts.color_selected_text or ""):gsub("^[#!]", "") .. "&}" .. indent_marker .. label
 		else
-			line = "{\1c&H" .. opts.color_normal .. "&}" .. prefix .. "{\1c&H" .. opts.color_normal_text .. "&}" .. indent_marker .. label
+			line = "{\\1c&H" .. (opts.color_normal or ""):gsub("^[#!]", "") .. "&}" .. prefix .. "{\\1c&H" .. (opts.color_normal_text or ""):gsub("^[#!]", "") .. "&}" .. indent_marker .. label
 		end
 		
-		ass:append(line .. "\N")
+		ass:append(line .. "\\N")
 	end
 
 	mp.set_osd_ass(0, 0, ass.text)

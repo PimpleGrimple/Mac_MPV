@@ -427,7 +427,9 @@ elseif os.execute '[ -d "/Applications" ]' == 0 and os.execute '[ -d "/Library" 
 end
 
 local function osc_color_convert(color)
-    return color:sub(6, 7) .. color:sub(4, 5) .. color:sub(2, 3)
+    color = (color or ""):gsub("^[#!]", "")
+    if color:len() ~= 6 then return "000000" end
+    return color:sub(5, 6) .. color:sub(3, 4) .. color:sub(1, 2)
 end
 
 local playpause_size = user_opts.playpause_size or 30
