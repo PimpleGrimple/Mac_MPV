@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Media Blocker",
+  "version": "3.59",
+  "description": "Intercepts and blocks stream URLs (m3u8, mp4, etc.) and shows a panel with a open-in-mpv or download button.",
+  "permissions": [
+    "webRequest",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "storage",
+    "tabs",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_start"
+    }
+  ],
+  "icons": {
+    "128": "icon128.png"
+  }
+}

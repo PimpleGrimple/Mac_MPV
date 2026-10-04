@@ -1,8 +1,10 @@
 -- Name: mpv-selectformat
 -- Author: koonix <me@koonix.org>
 -- Upstream: https://github.com/koonix/mpv-selectformat
--- Version: 1.0.3
+-- Version: 1.0.7
 -- License: MIT
+
+local script_name = "selectformat"
 
 -- ====================
 -- = requires
@@ -72,46 +74,56 @@ local function isempty(v) end
 local function isnum(v) end
 local function isstr(v) end
 local function istable(v) end
+local function hexcol(c) end
 
 -- ====================
 -- = options
 -- ====================
 
 local opts = {
-	-- Title filtering
 	prioritize_proto = true,
-    exclude_ai_upscaled = true,
+	exclude_ai_upscaled = true,
+	audio_cap_sub1000 = false,
 
-    -- Format prefixes and separators
-	prefix_header = "    ", -- a non-breaking space followed by 3 spaces (4 total)
-	prefix_norm = "  ",   -- a non-breaking space followed by 1 space (2 total)
+	-- Icons
+	prefix_header = "  ", -- non-breaking space + space
+	prefix_norm = "  ", -- non-breaking space + space
 	prefix_cursor = "● ",
 	prefix_norm_sel = "○ ",
-	prefix_indent = "◀ ",
-	prefix_child = " ◆",
-	prefix_foldable = "▶ ",
-	prefix_leaf = "◆ ",
-    header_separator = "─",
+	prefix_indent = "  ",
 
-    -- Menu position and style
-	menu_pos_x = 20,
-	menu_pos_y = 20,
-	curtain_opacity = 0.7,
-	menu_timeout = 6,
-    
-    -- Dynamic Colors (HEX without # or &H)
-    font = "SF Mono",
-    color_header = "ffbad4",
-    color_header_sep = "4d1b2e",
-    color_cursor = "e55d9b",
-    color_cursor_text = "ffe6f0",
-    color_selected = "ff82a6",
-    color_selected_text = "ffe6f0",
-    color_normal = "6c5a75",
-    color_normal_text = "99808f",
+	-- Header underline.
+	-- The separator is drawn by repeating `header_separator` N times,
+	-- where N = number of characters in the header text.
+	-- If `header_separator` is an ASCII character ("-", "=", "_", ...)
+	-- the underline will be EXACTLY the length of the header.
+	-- If it is a Unicode glyph like "─" it will often render wider
+	-- than one cell (font fallback on macOS does this), so the line
+	-- will overshoot. To compensate, lower `separator_scale` a bit
+	-- (e.g. 0.75).
+	header_separator = "-",
+	separator_scale = 1.0,
+
+	-- Position and style
+	menu_pos_x = 7,
+	menu_pos_y = 7,
+	ass_style = "{\\fnmonospace\\fs11}",
+
+	-- Dark curtain behind the menu
+	enable_curtain = true,
+	curtain_opacity = 0.65,
+
+	-- Colors (HEX without leading # or &H)
+	color_header = "ffbad4",
+	color_header_sep = "4d1b2e",
+	color_cursor = "e55d9b",
+	color_cursor_text = "ffe6f0",
+	color_selected = "ff82a6",
+	color_selected_text = "ffe6f0",
+	color_normal = "6c5a75",
+	color_normal_text = "99808f",
 }
-mp.options.read_options(opts, "selectformat")
-mp.options.read_options(opts)
+mp.options.read_options(opts, script_name)
 
 -- ====================
 -- = keys
@@ -119,7 +131,7 @@ mp.options.read_options(opts)
 
 local keys = {
 	{
-		{ "UP",             "k" },
+		{ "UP", "k" },
 		"up",
 		function()
 			menu_cursor_move(-1)
@@ -127,7 +139,7 @@ local keys = {
 		{ repeatable = true },
 	},
 	{
-		{ "DOWN",           "j" },
+		{ "DOWN", "j" },
 		"down",
 		function()
 			menu_cursor_move(1)
@@ -135,7 +147,7 @@ local keys = {
 		{ repeatable = true },
 	},
 	{
-		{ "PGUP",           "ctrl+u" },
+		{ "PGUP", "ctrl+u" },
 		"pgup",
 		function()
 			menu_cursor_move(-5)
@@ -143,7 +155,7 @@ local keys = {
 		{ repeatable = true },
 	},
 	{
-		{ "PGDWN",          "ctrl+d" },
+		{ "PGDWN", "ctrl+d" },
 		"pgdwn",
 		function()
 			menu_cursor_move(5)
@@ -203,7 +215,14 @@ local url = ""
 local ytdl_path = ""
 local ytdl_not_found = false
 local is_menu_shown = false
-local menu_timer = nil
+
+-- ====================
+-- = helpers
+-- ====================
+
+function hexcol(c)
+	return (c or "ffffff"):gsub("^[#!]", "")
+end
 
 -- ====================
 -- = functions
@@ -212,10 +231,9 @@ local menu_timer = nil
 function main()
 	mp.register_event("file-loaded", formats_fetch)
 	mp.register_event("end-file", menu_hide)
-	mp.add_key_binding("y", "menu", menu_toggle)
+	mp.add_key_binding(nil, "menu", menu_toggle)
 end
 
--- fetch the formats using youtube-dl asyncronously and hand them to formats_save()
 function formats_fetch()
 	if not update_url() then
 		return
@@ -223,16 +241,6 @@ function formats_fetch()
 
 	if data[url] then
 		return
-	end
-
-	-- Try loading from mpv's built-in ytdl hook cache first to avoid a redundant subprocess call!
-	local ytdl_output = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result")
-	if ytdl_output and ytdl_output.stdout then
-		formats_save(url, true, { status = 0, stdout = ytdl_output.stdout }, nil)
-		if data[url] and data[url] ~= "fetching" then
-			mp.msg.info("Loaded formats instantly from built-in ytdl cache.")
-			return
-		end
 	end
 
 	if not update_ytdl_path() then
@@ -245,7 +253,6 @@ function formats_fetch()
 	end)
 end
 
--- process the formats fetched by formats_fetch()
 function formats_save(url, success, result, error)
 	data[url] = nil
 
@@ -312,9 +319,9 @@ function formats_fold(width, height, audio_only)
 	end
 end
 
--- show/hide the menu
 function menu_toggle()
-    mp.options.read_options(opts, "selectformat")
+	mp.options.read_options(opts, script_name)
+
 	if not update_url() then
 		mp.osd_message("Formats are only fetched for internet videos.")
 		return
@@ -352,8 +359,6 @@ function menu_init_vars()
 	end
 end
 
--- put the cursor on the initially loaded format.
--- see the comments of the get_ytdl_mpvconf_args() function for more info.
 function menu_init_sel_pos()
 	local id = data[url].initial_format_id
 
@@ -373,64 +378,82 @@ end
 function menu_hide()
 	if is_menu_shown then
 		is_menu_shown = false
-		if menu_timer then menu_timer:kill(); menu_timer = nil end
 		mp.set_osd_ass(0, 0, "")
 		menu_keys_unbind()
 	end
 end
 
 function menu_draw()
-	if opts.menu_timeout and opts.menu_timeout > 0 then
-		if menu_timer then menu_timer:kill() end
-		menu_timer = mp.add_timeout(opts.menu_timeout, menu_hide)
-	end
-
 	local ass = mp.assdraw.ass_new()
-	if opts.curtain_opacity > 0 then
+
+	-- optional dark curtain behind the menu
+	if opts.enable_curtain and opts.curtain_opacity > 0 then
 		local w, h = mp.get_osd_size()
 		local alpha = 255 - math.ceil(255 * opts.curtain_opacity)
-		ass.text = string.format('{\\pos(0,0)\\rDefault\\an7\\1c&H000000&\\3c&H000000&\\4c&H000000&\\bord0\\shad0\\alpha&H%X&}', alpha)
+		ass.text = string.format(
+			"{\\pos(0,0)\\rDefault\\an7\\1c&H000000&\\3c&H000000&\\4c&H000000&\\bord0\\shad0\\alpha&H%X&}",
+			alpha
+		)
 		ass:draw_start()
 		ass:rect_cw(0, 0, w, h)
 		ass:draw_stop()
 		ass:new_event()
 	end
 
-	local header = get_menu_header()
-	local header_separator = (opts.prefix_header .. header):gsub(
-		".",
-		opts.header_separator
-	)
-
 	ass:pos(opts.menu_pos_x, opts.menu_pos_y)
-    local ass_style = string.format("{\\q2\\fn%s\\fnCourier New\\fnmonospace\\fs11\\1c&Hffe6f0&\\3c&H1a0812&\\bord2.5\\shad0\\1a&H00&\\3a&H00&}", opts.font)
-	ass:append(ass_style)
-	
-	ass:append(
-		"{\\1c&H" .. (opts.color_header or ""):gsub("^[#!]", "") .. "&\\b1}" .. opts.prefix_header .. header .. "{\\b0}\\N" ..
-		"{\\1c&H" .. (opts.color_header_sep or ""):gsub("^[#!]", "") .. "&}" .. header_separator .. "\\N"
+	ass:append(opts.ass_style)
+
+	-- header (colored, bold)
+	local header = get_menu_header()
+	ass:append(string.format(
+		"{\\1c&H%s&\\b1}%s%s{\\b0}\\N",
+		hexcol(opts.color_header),
+		opts.prefix_header,
+		header
+	))
+
+	-- underline: exact character count of prefix + header, scaled by
+	-- `separator_scale` so users can compensate for wide Unicode glyphs.
+	local sep_len = math.floor(
+		(#opts.prefix_header + #header) * opts.separator_scale
 	)
+	if sep_len > 0 then
+		ass:append(string.format(
+			"{\\b0\\1c&H%s&}%s\\N",
+			hexcol(opts.color_header_sep),
+			string.rep(opts.header_separator, sep_len)
+		))
+	end
 
+	-- rows
 	for idx, fmt in ipairs(data[url].formats) do
-		local indent_marker = menu_get_indent_marker(idx)
-		local label = fmt.label
-		if fmt.is_unfolded and indent_marker == opts.prefix_child then
-			local res_field = label:sub(1, 18):match("^(.-)%s*$")
-			label = string.format("%-18s%s", "  " .. res_field, label:sub(19))
-		end
-		
-		local prefix = menu_get_prefix(idx)
-		local line = ""
+		local is_cursor = idx == get_cursor_pos()
+		local is_selected = idx == get_selected_pos()
+			or (not fmt.is_unfolded and idx == get_parent_of_selected_pos())
 
-		if idx == get_cursor_pos() then
-			line = "{\\1c&H" .. (opts.color_cursor or ""):gsub("^[#!]", "") .. "&\\b1}" .. prefix .. "{\\1c&H" .. (opts.color_cursor_text or ""):gsub("^[#!]", "") .. "&}" .. indent_marker .. label .. "{\\b0}"
-		elseif idx == get_selected_pos() or (not fmt.is_unfolded and idx == get_parent_of_selected_pos()) then
-			line = "{\\1c&H" .. (opts.color_selected or ""):gsub("^[#!]", "") .. "&}" .. prefix .. "{\\1c&H" .. (opts.color_selected_text or ""):gsub("^[#!]", "") .. "&}" .. indent_marker .. label
+		local prefix_color, text_color
+		if is_cursor then
+			prefix_color = opts.color_cursor
+			text_color = opts.color_cursor_text
+		elseif is_selected then
+			prefix_color = opts.color_selected
+			text_color = opts.color_selected_text
 		else
-			line = "{\\1c&H" .. (opts.color_normal or ""):gsub("^[#!]", "") .. "&}" .. prefix .. "{\\1c&H" .. (opts.color_normal_text or ""):gsub("^[#!]", "") .. "&}" .. indent_marker .. label
+			prefix_color = opts.color_normal
+			text_color = opts.color_normal_text
 		end
-		
-		ass:append(line .. "\\N")
+
+		local prefix = menu_get_prefix(idx)
+		local indent_marker = menu_get_indent_marker(idx)
+
+		ass:append(string.format(
+			"{\\b0\\1c&H%s&}%s{\\1c&H%s&}%s%s\\N",
+			hexcol(prefix_color),
+			prefix,
+			hexcol(text_color),
+			indent_marker,
+			fmt.label
+		))
 	end
 
 	mp.set_osd_ass(0, 0, ass.text)
@@ -452,47 +475,13 @@ function menu_get_prefix(pos)
 end
 
 function menu_get_indent_marker(pos)
-	local fmt = data[url].formats[pos]
-	if fmt.is_unfolded then
-		if pos > 1 and data[url].formats[pos - 1].is_unfolded then
-			local prev = data[url].formats[pos - 1]
-			local function getres(f)
-				local r = (f.width or "") .. "x" .. (f.height or "")
-				if r == "x" then
-					r = is_format_audio_only(f) and "audio-only" or f.format_id
-				end
-				return r
-			end
-			if getres(fmt) == getres(prev) then
-				return opts.prefix_child
-			end
-		end
+	if data[url].formats[pos].is_unfolded then
 		return opts.prefix_indent
 	else
-		-- check if this resolution has multiple formats (can be unfolded)
-		local res = (fmt.width or "") .. "x" .. (fmt.height or "")
-		if res == "x" then
-			res = is_format_audio_only(fmt) and "audio-only" or fmt.format_id
-		end
-		local count = 0
-		for _, ufmt in ipairs(data[url].formats_unfolded) do
-			local ures = (ufmt.width or "") .. "x" .. (ufmt.height or "")
-			if ures == "x" then
-				ures = is_format_audio_only(ufmt) and "audio-only" or ufmt.format_id
-			end
-			if ures == res then
-				count = count + 1
-			end
-		end
-		if count > 1 then
-			return opts.prefix_foldable
-		else
-			return opts.prefix_leaf
-		end
+		return ""
 	end
 end
 
--- bind the menu movement/action keys
 function menu_keys_bind()
 	for _, v in ipairs(keys) do
 		for i, key in ipairs(v[1]) do
@@ -501,7 +490,6 @@ function menu_keys_bind()
 	end
 end
 
--- unbind the menu movement/action keys
 function menu_keys_unbind()
 	for _, v in ipairs(keys) do
 		for i in ipairs(v[1]) do
@@ -533,26 +521,6 @@ end
 
 function menu_unfold()
 	local cursor_fmt = data[url].formats[get_cursor_pos()]
-	if cursor_fmt.is_unfolded then
-		return
-	end
-	local res = (cursor_fmt.width or "") .. "x" .. (cursor_fmt.height or "")
-	if res == "x" then
-		res = is_format_audio_only(cursor_fmt) and "audio-only" or cursor_fmt.format_id
-	end
-	local count = 0
-	for _, ufmt in ipairs(data[url].formats_unfolded) do
-		local ures = (ufmt.width or "") .. "x" .. (ufmt.height or "")
-		if ures == "x" then
-			ures = is_format_audio_only(ufmt) and "audio-only" or ufmt.format_id
-		end
-		if ures == res then
-			count = count + 1
-		end
-	end
-	if count <= 1 then
-		return
-	end
 	formats_fold(
 		cursor_fmt.width,
 		cursor_fmt.height,
@@ -682,22 +650,31 @@ function no_formats_available()
 		or #data[url].formats == 0
 end
 
--- build the youtube-dl format option for the given format
 function build_ytdl_format_str(fmt)
 	if is_format_audio_only(fmt) then
 		return string.format("%s/bestaudio", fmt.format_id)
 	else
+		local audiofmt = "bestaudio"
+
+		if opts.audio_cap_sub1000 then
+			local h = tonumber(fmt.height) or 0
+			if h > 0 and h < 1000 then
+				audiofmt = "bestaudio[abr<=70]"
+			end
+		end
+
 		return string.format(
-			"%s+bestaudio/%s/best",
+			"%s+%s/%s+bestaudio/%s/best",
+			fmt.format_id,
+			audiofmt,
 			fmt.format_id,
 			fmt.format_id
 		)
 	end
 end
 
--- build the label that represents the format in the UI
 function build_format_label(fmt)
-	local res, codec, br, formatstr
+	local res, codec, br
 
 	if is_format_audio_only(fmt) then
 		res = "audio-only"
@@ -705,7 +682,10 @@ function build_format_label(fmt)
 		br = fmt.abr or fmt.tbr
 	else
 		res = (fmt.width or "?") .. "x" .. (fmt.height or "?")
-		if type(fmt.format_note) == "string" and fmt.format_note:find("AI%-upscaled") then
+		if
+			type(fmt.format_note) == "string"
+			and fmt.format_note:find("AI%-upscaled")
+		then
 			res = res .. " [AI-Upscaled]"
 		end
 		codec = fmt.vcodec
@@ -722,19 +702,19 @@ function build_format_label(fmt)
 		fmt.fps and numshorten(fmt.fps) or "",
 		codec or "",
 		br and numshorten(br * 10 ^ 3) or "",
+		fmt.asr and numshorten(fmt.asr) or "",
 		fmt.protocol or ""
 	)
 end
 
 function get_menu_header()
-	return strfmt_label("Resolution", "FPS", "Codec", "BR", "Proto")
+	return strfmt_label("Resolution", "FPS", "Codec", "BR", "ASR", "Proto")
 end
 
 function strfmt_label(...)
-	return string.format("%-18s │ %-4s │ %-5s │ %-5s │ %s", ...)
+	return string.format("%-10s %-3s %-5s %-4s %-4s %s", ...)
 end
 
--- function for sorting the formats table
 function format_sort_fn(a, b)
 	local params
 
@@ -752,14 +732,14 @@ function format_sort_fn(a, b)
 		}
 	else
 		params = {
-			"tbr",
-			"vbr",
-			"abr",
-			"asr",
 			"fps",
 			"dynamic_range",
 			"vcodec",
 			"acodec",
+			"tbr",
+			"vbr",
+			"abr",
+			"asr",
 			"protocol",
 		}
 	end
@@ -805,11 +785,7 @@ function format_sort_fn(a, b)
 	return a.format_id > b.format_id
 end
 
--- rate the given parameter value based on it's precedence
 function get_param_precedence(param, value)
-	-- orders of precedence.
-	-- each item in any of the categories is a list of lua patterns.
-	-- pattern lists are specified from low to high precedence.
 	local order = {
 		dynamic_range = {
 			{ "sdr" },
@@ -820,10 +796,9 @@ function get_param_precedence(param, value)
 			{ "h?d?r?12" },
 			{ "dv" },
 		},
-
 		vcodec = {
 			{ "theora" },
-			{ "mp4v",    "h263" },
+			{ "mp4v", "h263" },
 			{ "vp0?8" },
 			{ "[hx]264", "avc" },
 			{ "[hx]265", "he?vc" },
@@ -831,7 +806,6 @@ function get_param_precedence(param, value)
 			{ "vp0?9%.2" },
 			{ "av0?1" },
 		},
-
 		acodec = {
 			{ "dts" },
 			{ "^ac%-?3" },
@@ -839,21 +813,20 @@ function get_param_precedence(param, value)
 			{ "mp3" },
 			{ "mp?4a?" },
 			{ "avc" },
-			{ "vorbis",     "ogg" },
+			{ "vorbis", "ogg" },
 			{ "opus" },
 		},
-
 		protocol = {
 			{ "f4" },
-			{ "ws",            "websocket$" },
-			{ "mms",           "rtsp" },
+			{ "ws", "websocket$" },
+			{ "mms", "rtsp" },
 			{ "^$" },
 			{ "rtmpe?" },
 			{ "websocket_frag" },
 			{ ".*dash" },
 			{ "m3u8.*" },
-			{ "http$",         "ftp$" },
-			{ "https",         "ftps" },
+			{ "http$", "ftp$" },
+			{ "https", "ftps" },
 		},
 	}
 
@@ -877,14 +850,16 @@ function get_param_precedence(param, value)
 	return 0
 end
 
--- test whether the given format contains the bare minimum of information
 function is_format_useful(fmt)
 	if (not istable(fmt)) or fmt.ext == "mhtml" or fmt.protocol == "mhtml" then
 		return false
 	end
 
-	if opts.exclude_ai_upscaled and type(fmt.format_note) == "string"
-		and fmt.format_note:find("AI%-upscaled") then
+	if
+		opts.exclude_ai_upscaled
+		and type(fmt.format_note) == "string"
+		and fmt.format_note:find("AI%-upscaled")
+	then
 		return false
 	end
 
@@ -908,7 +883,6 @@ function is_format_useful(fmt)
 	return false
 end
 
--- convert the parameters of the given format to their own appropriate type
 function sanitize_format(fmt)
 	local numeric_params = {
 		"width",
@@ -954,7 +928,6 @@ function sanitize_format(fmt)
 	return fmt
 end
 
--- build and return the command that needs to run in order to fetch the formats
 function get_ytdl_cmdline()
 	local args = { ytdl_path, "--no-playlist", "-j" }
 
@@ -970,10 +943,6 @@ function get_ytdl_cmdline()
 	return args
 end
 
--- get youtube-dl's options that are specified in mpv's
--- command line options or config file. if we call the youtube-dl command
--- with these options included, the initially loaded format will be apparent
--- in the "format_id" parameter of the infojson.
 function get_ytdl_mpvconf_args()
 	local args = {}
 	local fmtopt = mp.get_property("ytdl-format")
@@ -1001,7 +970,6 @@ function get_ytdl_mpvconf_args()
 	return args
 end
 
--- test whether the given format contains only an audio stream
 function is_format_audio_only(fmt)
 	return (is_param_valid(fmt.acodec) and (not is_param_valid(fmt.vcodec)))
 		or (
@@ -1018,12 +986,10 @@ function is_param_valid(p)
 	return isnum(p) or (isstr(p) and (not is_param_empty(p)))
 end
 
--- test whether the given format parameter is empty
 function is_param_empty(p)
 	return isempty(p) or p == "none" or p == "null"
 end
 
--- update the global url variable with the URL of the currently playing video
 function update_url()
 	local path = mp.get_property("path")
 	if isstr(path) and is_network_stream(path) then
@@ -1034,9 +1000,8 @@ function update_url()
 	end
 end
 
--- shorten and format the given number (eg. 4560 -> 4K)
 function numshorten(n)
-	n = math.floor(n + 0.5) -- round the number
+	n = math.floor(n + 0.5)
 	if n >= 10 ^ 9 then
 		return string.format("%dG", n / 10 ^ 9)
 	elseif n >= 10 ^ 6 then
@@ -1048,8 +1013,6 @@ function numshorten(n)
 	end
 end
 
--- compare the given numbers, but only succeed if the larger
--- number is significantly (15%) larger than the smaller one.
 function sigcmp(a, operator, b)
 	local fraction = 0.15
 	if operator == ">" and a > b + (a * fraction) then
@@ -1061,8 +1024,6 @@ function sigcmp(a, operator, b)
 	end
 end
 
--- test whether the given path or URL is a network stream.
--- works by checking the given URL's protocol.
 function is_network_stream(path)
 	local proto = path:match("^(%a+)://")
 
@@ -1104,64 +1065,53 @@ function is_network_stream(path)
 	return false
 end
 
--- this function is a robust implementation of reload_resume()
 function reload_resume()
-	local timepos = mp.get_property_number("time-pos")
-	local paused = mp.get_property_native("pause")
-	local plcount = mp.get_property_number("playlist-count", 1)
-	local plpos = mp.get_property_number("playlist-pos", 0)
+	local timepos = mp.get_property("time-pos")
+	local duration = mp.get_property_native("duration")
+	local plcount = mp.get_property_number("playlist-count")
+	local plpos = mp.get_property_number("playlist-pos")
+	local playlist = {}
 
-	if not isstr(url) or url == "" then
-		return
+	for i = 0, plcount - 1 do
+		playlist[i] = mp.get_property("playlist/" .. i .. "/filename")
 	end
 
-	local options = {}
-	if timepos and isnum(timepos) and timepos > 0 then
-		options[#options + 1] = "start=" .. tostring(timepos)
-	end
-	if paused then
-		options[#options + 1] = "pause=yes"
-	end
-
-	local opt_str = table.concat(options, ",")
-
-	if plcount <= 1 then
-		if opt_str ~= "" then
-			mp.commandv("loadfile", url, "replace", 0, opt_str)
-		else
-			mp.commandv("loadfile", url, "replace")
+	if timepos and isnum(duration) and duration >= 0 then
+		local set_time_pos
+		set_time_pos = function(t)
+			mp.set_property("time-pos", timepos)
+			mp.unregister_event(set_time_pos)
 		end
+		mp.register_event("file-loaded", set_time_pos)
+		reload(url, timepos)
 	else
-		local playlist = {}
-		for i = 0, plcount - 1 do
-			playlist[i] = mp.get_property("playlist/" .. i .. "/filename")
-		end
+		reload(url, nil)
+	end
 
-		if opt_str ~= "" then
-			mp.commandv("loadfile", url, "replace", 0, opt_str)
-		else
-			mp.commandv("loadfile", url, "replace")
-		end
+	for i = 0, plpos - 1 do
+		mp.commandv("loadfile", playlist[i], "append")
+	end
 
-		for i = 0, plpos - 1 do
-			if playlist[i] then
-				mp.commandv("loadfile", playlist[i], "append")
-			end
-		end
+	mp.commandv("playlist-move", 0, plpos + 1)
 
-		if plpos > 0 then
-			mp.commandv("playlist-move", 0, plpos + 1)
-		end
-
-		for i = plpos + 1, plcount - 1 do
-			if playlist[i] then
-				mp.commandv("loadfile", playlist[i], "append")
-			end
-		end
+	for i = plpos + 1, plcount - 1 do
+		mp.commandv("loadfile", playlist[i], "append")
 	end
 end
 
--- find the executable path of yt-dlp or youtube-dl and update the ytdl_path variable
+function reload(path, timepos)
+	if timepos == nil then
+		mp.commandv("loadfile", path, "replace")
+		return
+	end
+	local success =
+		mp.commandv("loadfile", path, "replace", 0, "start=+" .. timepos)
+	if not success then
+		mp.msg.warn("falling back to old loadfile syntax (mpv <= v0.37.0)")
+		mp.commandv("loadfile", path, "replace", "start=+" .. timepos)
+	end
+end
+
 function update_ytdl_path()
 	if ytdl_not_found then
 		return false
@@ -1190,7 +1140,6 @@ function update_ytdl_path()
 	return false
 end
 
--- search in config dirs and system's path for the given youtube-dl executable name
 function find_executable_path(name)
 	local suffix = is_os_windows() and ".exe" or ""
 	local cname = mp.find_config_file(name .. suffix)
@@ -1204,8 +1153,6 @@ function find_executable_path(name)
 	return nil
 end
 
--- get the paths specified in ytdl_hook's ytdl_path script-opt
--- if there aren't any paths specified there, return false
 function get_ytdl_hook_opt_paths()
 	local paths = {}
 	local sep = is_os_windows() and ";" or ":"
@@ -1220,7 +1167,6 @@ function get_ytdl_hook_opt_paths()
 	return #paths > 0 and paths or false
 end
 
--- asynchronously execute shell commands using mpv's subprocess command
 function exec_async(args, fn)
 	mp.command_native_async({
 		name = "subprocess",
@@ -1230,7 +1176,6 @@ function exec_async(args, fn)
 	}, fn)
 end
 
--- execute shell commands using mpv's subprocess command
 function exec(args)
 	return mp.command_native({
 		name = "subprocess",

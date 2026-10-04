@@ -5,10 +5,10 @@ files, replaygain-fallback for untagged) -- no filter in the chain. The
 moment you adjust or scan, a lavfi volume filter carries just the unsaved
 delta on top of native, and disappears again once saved/reset/matched.
 
-KEYS
-  Meta+↑/↓            adjust ±0.10 dB      Meta+b   hardbake (lossless)
-  Shift+Meta+↑/↓       adjust ±0.01 dB      Meta+r   reset to baseline
-  Meta+s               EBU R128 scan        Meta+i   show info (4s)
+NOTE: replaygain-fallback is NOT cached. It is owned by mpv (and by any
+profiles that set it conditionally), read lazily, and observed so that a
+profile change mid-file is picked up. sync_native() only ever touches the
+per-file replaygain-preamp, never the global fallback.
 ]]
 
 local mp, utils, msg = require 'mp', require 'mp.utils', require 'mp.msg'
@@ -16,50 +16,44 @@ local mp, utils, msg = require 'mp', require 'mp.utils', require 'mp.msg'
 -- CONFIG -------------------------------------------------------------
 local RG_TARGET_LUFS = -18.0                 -- foobar2000 EBU R128 target
 local STEP_DB, MICRO_STEP_DB = 0.10, 0.01
-local MAX_DB, MIN_DB, EPS = 20.0, -20.0, 0.005  -- EPS: "no unsaved change" cutoff
+local MAX_DB, MIN_DB, EPS = 20.0, -20.0, 0.005
 local AUTO_BAKE_DEBOUNCE = 10
 local FILTER_LABEL = "replaygain"
 local AUTO_BAKE = false                      -- automatically bake scanned values
-local AUTO_SCAN = true                      -- automatically scan untagged files
-local GAIN_KEYS = { 
+local AUTO_SCAN = false                      -- automatically scan untagged files
+local STREAM_CACHE_MB = 50                   -- back-cache MB required to trigger stream auto-scan
+
+local GAIN_KEYS = {
     "REPLAYGAIN_TRACK_GAIN", "replaygain_track_gain",
     "REPLAYGAIN_ALBUM_GAIN", "replaygain_album_gain",
     "REPLAYGAIN_GAIN", "replaygain_gain" }
-local PEAK_KEY_MAP = { 
+local PEAK_KEY_MAP = {
     REPLAYGAIN_TRACK_GAIN = "REPLAYGAIN_TRACK_PEAK",
     REPLAYGAIN_ALBUM_GAIN = "REPLAYGAIN_ALBUM_PEAK",
     REPLAYGAIN_GAIN = "REPLAYGAIN_PEAK" }
 
 -- STATE ----------------------------------------------------------------
-local current_path, last_path, last_track_id, selected_audio_ff_index
+local current_path, last_path, last_ff_index
 local baseline_gain, file_gain, delta = 0.0, 0.0, 0.0
 local mpv_native_gain, mpv_has_tags = 0.0, false
 local disk_peak, pending_peak
 local has_tags_current, baking, scanning = false, false, false
-local autobake_timer
-local USER_RG_FALLBACK = tonumber(mp.get_property("options/replaygain-fallback")) or 0.0
-local file_just_loaded = false
+local autobake_timer, stream_scan_timer
+
+local function user_rg_fallback()
+    return tonumber(mp.get_property("options/replaygain-fallback")) or 0.0
+end
 
 local function effective_gain() return baseline_gain + delta end
--- What mpv already does with zero adjustment: the on-disk tag (tagged) or
--- the configured fallback (untagged).
-local function native_reference() return mpv_has_tags and mpv_native_gain or USER_RG_FALLBACK end
+local function native_reference() return mpv_has_tags and mpv_native_gain or user_rg_fallback() end
 local function clamp(v) return math.max(MIN_DB, math.min(MAX_DB, v)) end
 
 local function sync_native()
     if mpv_has_tags then
         mp.set_property_native("file-local-options/replaygain-preamp", 0)
-    else
-        mp.set_property_native("options/replaygain-fallback", USER_RG_FALLBACK)
     end
 end
 
--- TEST FILTER: remove+re-add with value baked into the creation string.
--- NOT af-command in-place updates -- that was tested three times for real
--- (double precision, float + multi-filter chain, float + single-filter
--- chain) and never actually took audible effect despite `volume` being a
--- genuinely runtime-command-capable AVOption. Remove+re-add is slower per
--- change but is the mechanism actually confirmed to work.
 local current_filter_d = 0.0
 local function filter_present()
     for _, f in ipairs(mp.get_property_native("af") or {}) do
@@ -77,8 +71,6 @@ local function set_filter_value(db)
     mp.commandv("af", "add", string.format("@%s:lavfi=[volume=%.2fdB:precision=double:eval=once]", FILTER_LABEL, db))
     current_filter_d = db
 end
--- Filter carries exactly the unsaved amount beyond native; removed when
--- nothing's unsaved so idle playback stays 100% native.
 local function sync_filter()
     local d = effective_gain() - native_reference()
     if math.abs(d) <= EPS then remove_filter() else set_filter_value(d) end
@@ -115,8 +107,6 @@ local function get_write_key()
     for _, k in ipairs(GAIN_KEYS) do if meta[k] then return k:upper() end end
     return "REPLAYGAIN_TRACK_GAIN"
 end
--- Explicit map, not gsub("GAIN","PEAK") -- "REPLAYGAIN_TRACK_GAIN" contains "GAIN"
--- twice, so a blind substitute corrupts it into "REPLAYPEAK_TRACK_PEAK".
 local function get_peak_key(k) return PEAK_KEY_MAP[k] or "REPLAYGAIN_TRACK_PEAK" end
 
 local function get_audio_relative_index()
@@ -127,6 +117,21 @@ local function get_audio_relative_index()
             n = n + 1
         end
     end
+end
+
+local function selected_audio_ff_index()
+    for _, t in ipairs(mp.get_property_native("track-list") or {}) do
+        if t.type == "audio" and t.selected then return t["ff-index"] end
+    end
+end
+
+-- PEAK COMPARISON ------------------------------------------------------
+local function peak_eq(a, b)
+    if (a == nil) ~= (b == nil) then return false end
+    if a == nil then return true end
+    local na, nb = tonumber(a), tonumber(b)
+    if na and nb then return math.abs(na - nb) <= 1e-6 end
+    return tostring(a) == tostring(b)
 end
 
 -- OSD ----------------------------------------------------------------
@@ -141,7 +146,7 @@ end
 local function osd_state(dur, detailed)
     local eff, ddisk = effective_gain(), effective_gain() - file_gain
     local unsaved = math.abs(ddisk) > EPS
-    
+
     local txt
     if detailed then
         txt = string.format("Gain: %s\nFile Tag: %s   %s\nPeak: %s",
@@ -154,11 +159,11 @@ local function osd_state(dur, detailed)
             txt = txt .. string.format(" (Δ %s)", fmt_gain(ddisk))
         end
     end
-    
+
     mp.osd_message(txt, dur or 2.5)
 end
 
-local hardbake, scan_current  -- forward declarations (mutually referenced)
+local hardbake, scan_current
 
 local function schedule_autobake()
     if not AUTO_BAKE then return end
@@ -189,57 +194,7 @@ end
 
 local function show_info() osd_state(4, true) end
 
-
-
--- LOAD -----------------------------------------------------------------
-local function load_replaygain(force)
-    local path = mp.get_property("path")
-    if not path then return end
-
-    local has_audio = false
-    for _, t in ipairs(mp.get_property_native("track-list") or {}) do
-        if t.type == "audio" then has_audio = true break end
-    end
-    if not has_audio then
-        if autobake_timer then autobake_timer:kill() autobake_timer = nil end
-        remove_filter()
-        current_path, last_path, last_track_id, selected_audio_ff_index = nil, nil, nil, nil
-        return
-    end
-
-    local abs_path = mp.command_native({"expand-path", path}) or path
-
-    local track_id, ff_index
-    for _, t in ipairs(mp.get_property_native("track-list") or {}) do
-        if t.type == "audio" and t.selected then track_id, ff_index = t.id, t["ff-index"] break end
-    end
-
-    local should_force = force or file_just_loaded
-    file_just_loaded = false
-
-    if not should_force and abs_path == last_path and track_id == last_track_id then return end
-    last_path, last_track_id, selected_audio_ff_index, current_path = abs_path, track_id, ff_index, abs_path
-    delta = 0.0
-    if autobake_timer then autobake_timer:kill() autobake_timer = nil end
-    remove_filter()  -- new file: start fully native
-
-    local gain, peak, has_tags = read_tags()
-    has_tags_current = has_tags
-    mpv_has_tags = has_tags
-    baseline_gain = has_tags and gain or USER_RG_FALLBACK
-    file_gain     = has_tags and gain or 0.0
-    mpv_native_gain = file_gain
-    disk_peak, pending_peak = peak, peak
-
-    sync_native()
-    sync_filter()
-
-    msg.info(string.format("replaygain: %s peak=%s has_tags=%s path=%s",
-        fmt_gain(baseline_gain), fmt_peak(pending_peak), tostring(has_tags), current_path))
-
-    if not has_tags and AUTO_SCAN then scan_current(true) end
-end
-
+-- HELPERS --------------------------------------------------------------
 local function is_stream_or_pipe(path)
     if not path then return true end
     if path == "-" or path == "stdin" or path:match("^fd://") then return true end
@@ -256,42 +211,71 @@ local function is_stream_or_pipe(path)
     return false
 end
 
+-- SCAN -----------------------------------------------------------------
 local scan_handle, scan_path
 scan_current = function(is_auto)
-    if scanning then 
+    if scanning then
         if scan_path == current_path then
             if not is_auto then mp.osd_message("Scan already in progress…", 2) end
-            return 
+            return
         else
             if scan_handle then mp.abort_async_command(scan_handle) end
             scan_handle, scanning = nil, false
         end
     end
     if not current_path then mp.osd_message("No file loaded", 2) return end
-    if is_stream_or_pipe(current_path) then
-        if not is_auto then mp.osd_message("Cannot scan: not a local file", 3) end
-        return
+
+    local orig_path, t0 = current_path, mp.get_time()
+    local is_stream = is_stream_or_pipe(orig_path)
+    local scan_target = orig_path
+    local tmp_dump = nil
+
+    if is_stream then
+        -- Process ID appended to avoid collisions with concurrent mpv instances
+        local pid = mp.get_property("pid") or "0"
+        tmp_dump = string.format("/tmp/mpv_cache_dump_%s.mkv", pid)
+        
+        if not is_auto then mp.osd_message("Dumping cache for scan...", 2) end
+        
+        mp.command_native({"dump-cache", "0", "999999", tmp_dump})
+        
+        local f = io.open(tmp_dump, "r")
+        if not f then
+            mp.osd_message("Cache dump failed", 3)
+            return
+        end
+        f:close()
+        scan_target = tmp_dump
+    elseif not is_auto then
+        mp.osd_message("Scanning loudness…", 999)
     end
 
-    local path, t0 = current_path, mp.get_time()
-    local args = { "ffmpeg", "-nostdin", "-hide_banner", "-vn", "-sn", "-dn", "-i", path }
-    if selected_audio_ff_index then
-        table.insert(args, "-map"); table.insert(args, "0:" .. tostring(selected_audio_ff_index))
+    local scanned_ff_index = last_ff_index
+    local args = { "ffmpeg", "-nostdin", "-hide_banner", "-vn", "-sn", "-dn", "-i", scan_target }
+    
+    if is_stream then
+        -- Cache dumps remux audio; original ff_index is lost. Safe fallback is first audio track.
+        table.insert(args, "-map"); table.insert(args, "0:a:0")
+    elseif scanned_ff_index then
+        table.insert(args, "-map"); table.insert(args, "0:" .. tostring(scanned_ff_index))
     end
+    
     for _, a in ipairs({ "-af", "ebur128=peak=true:framelog=quiet", "-f", "null", "-" }) do
         table.insert(args, a)
     end
 
-    scanning, scan_path = true, path
-    if not is_auto then
-        mp.osd_message("Scanning loudness… (playback continues)", 999)
-    end
+    scanning, scan_path = true, orig_path
 
     scan_handle = mp.command_native_async({ name = "subprocess", args = args, playback_only = false,
         capture_stdout = false, capture_stderr = true },
     function(success, result, err)
         scanning, scan_handle = false, nil
-        if current_path ~= path then msg.info("replaygain: scan discarded (file changed)") return end
+        if tmp_dump then os.remove(tmp_dump) end
+
+        if current_path ~= orig_path or last_ff_index ~= scanned_ff_index then
+            msg.info("replaygain: scan discarded (file/track changed)")
+            return
+        end
         local stderr = result and result.stderr
         if not (success and result and result.status == 0) then
             mp.osd_message("Scan FAILED — see console", 4)
@@ -308,25 +292,80 @@ scan_current = function(is_auto)
         local computed = RG_TARGET_LUFS - lufs
 
         baseline_gain = computed
-        pending_peak  = dbfs and tostring(10 ^ (dbfs / 20)) or nil
-        delta = 0.0
+        pending_peak  = dbfs and string.format("%.6f", 10 ^ (dbfs / 20)) or nil
+        delta = clamp(effective_gain()) - baseline_gain
         sync_filter()
 
         local scan_delta = computed - file_gain
         local gain_changed = math.abs(scan_delta) > EPS
-        local peak_changed = (pending_peak == nil) ~= (disk_peak == nil)
-            or (pending_peak and disk_peak and tostring(pending_peak) ~= tostring(disk_peak))
+        local peak_changed = not peak_eq(pending_peak, disk_peak)
         local changed = gain_changed or peak_changed
 
-        local delta_str = gain_changed and (" (Δ " .. fmt_gain(scan_delta) .. ")") or ""
+        local delta_str = string.format(" (Δ %s)", fmt_gain(scan_delta))
 
         msg.info(string.format("replaygain: scan done in %.1fs — I=%.1f LUFS → %s%s",
             mp.get_time() - t0, lufs, fmt_gain(computed), gain_changed and ("  (Δ " .. fmt_gain(scan_delta) .. ")") or "  (unchanged)"))
         mp.osd_message(string.format("Scan Complete: %s%s",
             fmt_gain(computed), delta_str), 4)
 
-        if AUTO_BAKE and changed then schedule_autobake() end
+        if AUTO_BAKE and changed and not is_stream then schedule_autobake() end
     end)
+end
+
+-- LOAD -----------------------------------------------------------------
+local function load_replaygain(force)
+    local path = mp.get_property("path")
+    if not path then return end
+
+    local ff_index = selected_audio_ff_index()
+    if not ff_index then
+        if autobake_timer then autobake_timer:kill() autobake_timer = nil end
+        remove_filter()
+        current_path, last_path, last_ff_index = nil, nil, nil
+        return
+    end
+
+    local abs_path = mp.command_native({"expand-path", path}) or path
+
+    if not force and abs_path == last_path and ff_index == last_ff_index then return end
+    last_path, last_ff_index, current_path = abs_path, ff_index, abs_path
+    delta = 0.0
+    if autobake_timer then autobake_timer:kill() autobake_timer = nil end
+    if stream_scan_timer then stream_scan_timer:kill() stream_scan_timer = nil end
+    remove_filter()
+
+    local gain, peak, has_tags = read_tags()
+    has_tags_current = has_tags
+    mpv_has_tags = has_tags
+    local fb = user_rg_fallback()
+    baseline_gain = has_tags and gain or fb
+    file_gain     = has_tags and gain or 0.0
+    mpv_native_gain = file_gain
+    disk_peak, pending_peak = peak, peak
+
+    sync_native()
+    sync_filter()
+
+    msg.info(string.format("replaygain: %s peak=%s has_tags=%s fallback=%.2f path=%s",
+        fmt_gain(baseline_gain), fmt_peak(pending_peak), tostring(has_tags), fb, current_path))
+
+    if not has_tags and AUTO_SCAN then
+        if is_stream_or_pipe(current_path) then
+            stream_scan_timer = mp.add_periodic_timer(3, function()
+                if scanning then return end
+                local back_bytes = mp.get_property_number("demuxer-cache-state/back-bytes", 0)
+                if back_bytes >= (STREAM_CACHE_MB * 1024 * 1024) then
+                    if stream_scan_timer then 
+                        stream_scan_timer:kill()
+                        stream_scan_timer = nil 
+                    end
+                    scan_current(true)
+                end
+            end)
+        else
+            scan_current(true)
+        end
+    end
 end
 
 -- HARDBAKE (lossless -c copy remux) --------------------------------------
@@ -340,8 +379,7 @@ hardbake = function()
     local peak_key  = get_peak_key(write_key)
 
     local gain_changed = math.abs(eff - file_gain) > EPS
-    local peak_changed = (pending_peak == nil) ~= (disk_peak == nil)
-        or (pending_peak and disk_peak and tostring(pending_peak) ~= tostring(disk_peak))
+    local peak_changed = not peak_eq(pending_peak, disk_peak)
     if not gain_changed and not peak_changed then mp.osd_message("No changes to save", 2) return end
 
     local dir, filename = utils.split_path(path)
@@ -393,10 +431,7 @@ hardbake = function()
             end
             if still_current then
                 baseline_gain, file_gain, disk_peak, delta = eff, eff, pending_peak, 0.0
-                has_tags_current = true  -- file now genuinely has this tag on disk
-                -- Intentionally do NOT update mpv_has_tags or mpv_native_gain.
-                -- mpv will not read the new tags until it reloads the file.
-                -- Keeping them old ensures sync_filter() maintains the lavfi volume bridge.
+                has_tags_current = true
                 sync_native()
                 sync_filter()
                 mp.osd_message(string.format("Saved ✓  %s = %s  (Δ was %s)",
@@ -414,7 +449,21 @@ end
 
 -- EVENTS & BINDINGS --------------------------------------------------
 mp.observe_property("track-list", "native", function() load_replaygain(false) end)
-mp.register_event("file-loaded", function() file_just_loaded = true load_replaygain(true) end)
+mp.register_event("file-loaded", function() load_replaygain(true) end)
+
+mp.register_event("end-file", function()
+    if scan_handle then mp.abort_async_command(scan_handle) scan_handle, scanning = nil, false end
+    if autobake_timer then autobake_timer:kill() autobake_timer = nil end
+    if stream_scan_timer then stream_scan_timer:kill() stream_scan_timer = nil end
+end)
+
+mp.observe_property("options/replaygain-fallback", "native", function(_, v)
+    if not current_path then return end
+    if mpv_has_tags then return end
+    baseline_gain = tonumber(v) or 0.0
+    delta = clamp(effective_gain()) - baseline_gain
+    sync_filter()
+end)
 
 mp.add_key_binding("meta+up",         "replaygain-increase",       increase_gain,       {repeatable=true})
 mp.add_key_binding("meta+down",       "replaygain-decrease",       decrease_gain,       {repeatable=true})

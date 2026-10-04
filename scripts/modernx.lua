@@ -90,7 +90,7 @@ local user_opts = {
     layout_option = "original", -- use the original/reduced layout
     idle_screen = true,         -- show mpv logo when idle
     key_bindings = true,        -- register additional key bindings, such as chapter scrubbing, pinning the window
-    window_top_bar = "auto",    -- show OSC window top bar: "auto", "yes", or "no" (borderless/fullscreen)
+    window_top_bar = "no",    -- show OSC window top bar: "auto", "yes", or "no" (borderless/fullscreen)
     show_windowed = true,       -- show OSC when windowed
     show_fullscreen = true,     -- show OSC when fullscreen
     show_on_pause = true,       -- show OSC when paused
@@ -241,7 +241,7 @@ local user_opts = {
 
     -- Web videos
     title_youtube_stats = true, -- update the window/OSC title bar with YouTube video stats (views, comments, likes)
-    ytdl_format = "'bv*[format_note!*=?AI-upscaled]+ba/b[format_note!*=?AI-upscaled]/b'",           -- optional parameteres for yt-dlp downloading, eg: '-f bestvideo+bestaudio/best'
+    ytdl_format ="",                                  -- optional parameters for yt-dlp downloading, eg: '-f bestvideo+bestaudio/best'. If empty, uses mpv ytdl-format or yt-dlp config
 
     -- SponsorBlock - these SponsorBlock features need https://github.com/zydezu/mpvconfig/blob/main/scripts/sponsorblock.lua specifically to function
     show_sponsorblock_segments = true,             -- show SponsorBlock segments on the progress bar
@@ -318,6 +318,9 @@ local icons = {
     screenshot = "\239\154\142",
     playlist = "\238\161\159", -- currently unused
 
+    favorite = "\239\145\186",
+    favorite_filled = "\239\145\183",
+
     fullscreen = "\239\133\160",
     fullscreen_exit = "\239\133\166",
 
@@ -378,8 +381,8 @@ local function contains(list, item)
     local t = {}
     if type(list) ~= "table" then
         for str in string.gmatch(list, '([^,]+)') do
-            str = str:gsub("%s+", "")
-            table.insert(t, str)
+            local s = str:gsub("%s+", "")
+            table.insert(t, s)
         end
     else
         t = list
@@ -1694,6 +1697,7 @@ local function newfilereset()
 end
 
 local function startupevents()
+    state.is_favorite = mp.get_property_bool("user-data/is-favorite", false)
     state.new_file_flag = true
     set_tick_delay("display_fps", mp.get_property_number("display_fps"))
     state.videoDescription = "Loading description..."
@@ -3220,10 +3224,22 @@ layouts["original"] = function()
         lo.visible = (osc_param.playresx >= 300 - outeroffset)
     end
 
+    lo = add_layout('favorite')
+    lo.geometry = {
+        x = osc_geo.w - 262 + (loop_button and 0 or 45) + (ontop_button and 0 or 45) +
+            (info_button and 0 or 45) + (screenshot_button and 0 or 45),
+        y = refY - 40,
+        an = 5,
+        w = 24,
+        h = 24
+    }
+    lo.style = osc_styles.control_3
+    lo.visible = (osc_param.playresx >= 400 - outeroffset)
+
     if user_opts.download_button then
         lo = add_layout('download')
         lo.geometry = {
-            x = osc_geo.w - 262 + (loop_button and 0 or 45) + (ontop_button and 0 or 45) +
+            x = osc_geo.w - 307 + (loop_button and 0 or 45) + (ontop_button and 0 or 45) +
                 (info_button and 0 or 45) + (screenshot_button and 0 or 45),
             y = refY - 40,
             an = 5,
@@ -3231,7 +3247,7 @@ layouts["original"] = function()
             h = 24
         }
         lo.style = osc_styles.control_3
-        lo.visible = (osc_param.playresx >= 400 - outeroffset)
+        lo.visible = (osc_param.playresx >= 450 - outeroffset)
     end
 end
 
@@ -3494,10 +3510,22 @@ layouts["reduced"] = function()
         lo.visible = (osc_param.playresx >= 300 - outeroffset)
     end
 
+    lo = add_layout('favorite')
+    lo.geometry = {
+        x = osc_geo.w - 262 + (loop_button and 0 or 45) + (ontop_button and 0 or 45) +
+            (info_button and 0 or 45) + (screenshot_button and 0 or 45),
+        y = refY - 40,
+        an = 5,
+        w = 24,
+        h = 24
+    }
+    lo.style = osc_styles.control_3
+    lo.visible = (osc_param.playresx >= 400 - outeroffset)
+
     if user_opts.download_button then
         lo = add_layout('download')
         lo.geometry = {
-            x = osc_geo.w - 262 + (loop_button and 0 or 45) + (ontop_button and 0 or 45) +
+            x = osc_geo.w - 307 + (loop_button and 0 or 45) + (ontop_button and 0 or 45) +
                 (info_button and 0 or 45) + (screenshot_button and 0 or 45),
             y = refY - 40,
             an = 5,
@@ -3505,7 +3533,7 @@ layouts["reduced"] = function()
             h = 24
         }
         lo.style = osc_styles.control_3
-        lo.visible = (osc_param.playresx >= 400 - outeroffset)
+        lo.visible = (osc_param.playresx >= 450 - outeroffset)
     end
 end
 
@@ -4016,14 +4044,18 @@ local function osc_init()
                     mp.get_property("file-local-options/ytdl-format") or mp.get_property("ytdl-format") or ""
 
                 local ytdl_args = {}
-                if mpv_ytdl and mpv_ytdl ~= "" then
-                    if not string.match(mpv_ytdl, "^%-") then
+                if mpv_ytdl and mpv_ytdl ~= "" and mpv_ytdl ~= "ytdl" then
+                    if string.match(mpv_ytdl, "^%-") then
+                        for raw_arg in string.gmatch(mpv_ytdl, "[^%s]+") do
+                            local clean_arg = string.gsub(raw_arg, "^['\"]", "")
+                            clean_arg = string.gsub(clean_arg, "['\"]$", "")
+                            table.insert(ytdl_args, clean_arg)
+                        end
+                    else
+                        local fmt = string.gsub(mpv_ytdl, "^['\"]", "")
+                        fmt = string.gsub(fmt, "['\"]$", "")
                         table.insert(ytdl_args, "-f")
-                    end
-                    for arg in string.gmatch(mpv_ytdl, "[^%s]+") do
-                        arg = string.gsub(arg, "^['\"]", "")
-                        arg = string.gsub(arg, "['\"]$", "")
-                        table.insert(ytdl_args, arg)
+                        table.insert(ytdl_args, fmt)
                     end
                 end
 
@@ -4111,6 +4143,23 @@ local function osc_init()
         else
             show_message("{\\an9}Can't be downloaded")
         end
+    end
+
+    --favorite
+    ne = new_element('favorite', 'button')
+    ne.content = function()
+        return state.is_favorite and icons.favorite_filled or icons.favorite
+    end
+    ne.tooltip_style = osc_styles.tooltip
+    ne.tooltipF = function()
+        return state.is_favorite and "In Favorites (Right click: Playlists)" or "Add to Favorites (Right click: Playlists)"
+    end
+    ne.visible = (osc_param.playresx >= 400 - outeroffset)
+    ne.eventresponder['mbtn_left_up'] = function()
+        mp.commandv('script-message', 'toggle_favorite')
+    end
+    ne.eventresponder['mbtn_right_up'] = function()
+        mp.commandv('script-message', 'open_playlist_menu')
     end
 
     --screenshot
@@ -5073,6 +5122,12 @@ mp.observe_property('window-maximized', 'bool',
 mp.observe_property('idle-active', 'bool',
     function(_, val)
         state.idle = val
+        request_tick()
+    end
+)
+mp.observe_property('user-data/is-favorite', 'bool',
+    function(_, val)
+        state.is_favorite = (val == true)
         request_tick()
     end
 )

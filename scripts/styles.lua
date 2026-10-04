@@ -1,13 +1,8 @@
--- ==============================================================================
--- MPV Theming Engine (Consolidated Single Menu)
--- ==============================================================================
-
 local mp = require("mp")
 local utils = require("mp.utils")
 local assdraw = require("mp.assdraw")
 local options = require("mp.options")
 
--- Default Configuration (Can be overridden by script-opts)
 local CONFIG = {
     bg_color = "2D0823",         -- Menu Background Color
     bg_alpha = "90",             -- Menu Background Transparency (00=Solid, FF=Invisible)
@@ -21,7 +16,7 @@ local CONFIG = {
 }
 options.read_options(CONFIG, "styles")
 
-local STATE_FILE = mp.command_native({"expand-path", "~~/cache/scripts/sub_styles.json"})
+local STATE_FILE = mp.command_native({"expand-path", "~~/cache/scripts/styles.json"})
 
 local V_WIDTH = 1280
 local V_HEIGHT = 720
@@ -91,9 +86,7 @@ local menu_cursor = 1
 local menu_active = false
 local menu_timer = nil
 
--- ==============================================================================
 -- Persistence
--- ==============================================================================
 
 local function save_state()
     local save_obj = {
@@ -119,10 +112,7 @@ local function load_state()
     end
 end
 
--- ==============================================================================
 -- Application Logic
--- ==============================================================================
-
 local function apply_profile(index, show_osd, silent)
     local item = profiles[index]
     if not item then return end
@@ -155,10 +145,7 @@ local function live_apply_preview()
     options.read_options(CONFIG, "styles")
 end
 
--- ==============================================================================
 -- UI & Menu System
--- ==============================================================================
-
 local function close_menu()
     if not menu_active then return end
     menu_active = false
@@ -321,22 +308,38 @@ local function toggle_menu()
     end
 end
 
--- ==============================================================================
 -- Auto-Style Detection & File Load Handler
--- ==============================================================================
+local function apply_saved_profile()
+    -- Ensure styles configuration is parsed before attempting to apply
+    if #profiles == 0 then
+        parse_styles_conf()
+    end
 
-local function on_file_loaded()
     load_state()
-    apply_profile(state.profile_idx, false, true)
+
+    -- Safety fallback if index out of range
+    if state.profile_idx > #profiles or state.profile_idx < 1 then
+        state.profile_idx = 1
+    end
+
+    local item = profiles[state.profile_idx]
+    if item then
+        mp.commandv("apply-profile", item.id)
+        if CONFIG.override_ass then
+            mp.set_property("sub-ass-override", CONFIG.ass_override_mode)
+        end
+    end
 end
 
-load_state()
+local function on_file_loaded()
+    -- Slight non-blocking delay (0.05s) to guarantee mpv internal 
+    -- property states and profile hooks are fully ready.
+    mp.add_timeout(0.05, apply_saved_profile)
+end
+
 mp.register_event("file-loaded", on_file_loaded)
 
--- ==============================================================================
 -- Keybindings Registration
--- ==============================================================================
-
 local function cycle_forward()
     state.profile_idx = state.profile_idx + 1
     if state.profile_idx > #profiles then state.profile_idx = 1 end

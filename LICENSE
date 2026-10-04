@@ -1,0 +1,34 @@
+MIT License
+
+Copyright (c) 2026 PimpleGrimple
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+### Third-Party Software & Licenses
+
+This configuration repository includes, wraps, and adapts third-party scripts, shaders, and utilities. Each component retains its original license:
+
+- **SmartCut** (`scripts/smartcut/`): GNU General Public License v3.0 (skeskinen)
+- **ModernX** (`scripts/modernx.lua`): GNU Lesser General Public License / MIT (zydezu & upstream contributors)
+- **Thumbfast** (`scripts/thumbfast.lua`): GNU General Public License v3.0 (po5)
+- **AutoSubSync** (`scripts/autosubsync/`): MIT License (joaquinteixeira / alass by kaegi)
+- **SponsorBlock** (`scripts/sponsorblock/`): GNU Lesser General Public License v3.0 (po5 & Ajayyy)
+- **Shaders & Presets** (`shaders/`, `luts/`): Respective author licenses (Anime4K by bloc97, ArtCNN by Artoria2e5, FSRCNNX by igv, CuNNy by HelpSeeker, Ravu by bjin, KrigBilateral by Shiandow)

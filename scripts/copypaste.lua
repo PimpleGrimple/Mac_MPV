@@ -1,56 +1,57 @@
 local mp = require("mp")
 local utils = require("mp.utils")
-local display_protocol = os.getenv("XDG_SESSION_TYPE")
 
 local options = {
-    copy_keybind = [[ ["ctrl+c", "meta+c"] ]],
-    paste_keybind = [[ ["ctrl+v", "meta+v"] ]],
-    copy_sub_keybind = [[ ["ctrl+C", "meta+C"] ]],
-    open_keybind = "o",
-
-    linux_copy_command = { "xclip", "-silent", "-selection", "clipboard", "-in" },
-    linux_paste_command = "xclip -selection clipboard -o",
-    copy_youtube_timestamp = true,
+    copy_keybind = [[ ["meta+c"] ]],
+    paste_keybind = [[ ["meta+v"] ]],
+    copy_timestamp_keybind = [[ ["meta+alt+c", "meta+shift+t"] ]],
+    copy_timestamped_url = true,
 }
-
-if display_protocol == "wayland" then
-    options.linux_copy_command = { "wl-copy" }
-    options.linux_paste_command = "wl-paste"
-end
 
 (require "mp.options").read_options(options)
 options.copy_keybind = utils.parse_json(options.copy_keybind)
 options.paste_keybind = utils.parse_json(options.paste_keybind)
-options.copy_sub_keybind = utils.parse_json(options.copy_sub_keybind)
-
-local device = "linux"
-if os.getenv("windir") ~= nil then
-    device = "windows"
-elseif os.execute('[ -d "/Applications" ]') == 0 and os.execute('[ -d "/Library" ]') == 0 then
-    device = "mac"
-end
+options.copy_timestamp_keybind = utils.parse_json(options.copy_timestamp_keybind)
 
 local function bind_keys(keys, name, func)
-    if not keys then mp.add_forced_key_binding(keys, name, func); return end
+    if not keys then return end
     for i = 1, #keys do
-        mp.add_forced_key_binding(keys[i], name .. (i == 1 and "" or i), func)
+        mp.add_key_binding(keys[i], name .. (i == 1 and "" or i), func)
     end
 end
 
 local function is_url(s)
-    return string.match(s, "^https?://%S+$") ~= nil
+    return s and string.match(s, "^https?://%S+$") ~= nil
 end
 
 local function extract_timestamp(str)
     if not str then return nil end
-    local h, m, s = string.match(str, "^%s*(%d+):(%d%d):(%d%d)%s*$")
-    if h and m and s then
-        return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+    local h, m, s = string.match(str, "^%s*(%d+):(%d%d):(%d%d%.?%d*)%s*$")
+    if h and m and s then return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) end
+    local m2, s2 = string.match(str, "^%s*(%d+):(%d%d%.?%d*)%s*$")
+    if m2 and s2 then return tonumber(m2) * 60 + tonumber(s2) end
+    return nil
+end
+
+local function extract_url_timestamp(url)
+    if not url then return nil end
+    local param = url:match("[?&#]t=([%w%.]+)") or url:match("[?&#]start=(%d+)") or url:match("[?&#]time=([%w%.]+)")
+    if not param then return nil end
+
+    -- Ignore huge Unix timestamps used for CDN authentication
+    local max_reasonable_time = 1000000 
+
+    local pure_sec = param:match("^(%d+%.?%d*)s?$")
+    if pure_sec then 
+        local sec = tonumber(pure_sec)
+        if sec and sec <= max_reasonable_time then return sec end
     end
-    local m2, s2 = string.match(str, "^%s*(%d+):(%d%d)%s*$")
-    if m2 and s2 then
-        return tonumber(m2) * 60 + tonumber(s2)
-    end
+
+    local h = param:match("(%d+)h") or 0
+    local m = param:match("(%d+)m") or 0
+    local s = param:match("(%d+)s") or 0
+    local total = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+    if total > 0 and total <= max_reasonable_time then return total end
     return nil
 end
 
@@ -73,51 +74,69 @@ local function file_exists(name)
     if f ~= nil then io.close(f); return true else return false end
 end
 
-local function set_clipboard(text)
-    local args
-    if device == "mac" then
-        args = { "/usr/bin/pbcopy" }
-    elseif device == "linux" then
-        args = options.linux_copy_command
-    elseif device == "windows" then
-        args = { "powershell", "-NoProfile", "-Command", "Add-Type -AssemblyName PresentationCore; [System.Windows.Clipboard]::SetText('" .. text:gsub("'", "''") .. "')" }
+local function format_timestamp(sec)
+    if not sec or sec < 0 then sec = 0 end
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    local s = sec % 60
+    if h > 0 then
+        return string.format("%02d:%02d:%02d", h, m, math.floor(s))
+    else
+        return string.format("%02d:%02d", m, math.floor(s))
     end
-    if args then mp.command_native_async({ name = "subprocess", args = args, stdin_data = text }) end
+end
+
+local function set_clipboard(text)
+    mp.command_native_async({ name = "subprocess", playback_only = false, args = { "/usr/bin/pbcopy" }, stdin_data = text })
 end
 
 local function get_clipboard()
-    if device == "mac" then
-        -- Check text/URL clipboard first via pbpaste
-        local handle = io.popen("/usr/bin/pbpaste 2>/dev/null")
-        local txt = handle and handle:read("*a")
-        if handle then handle:close() end
+    local res = mp.command_native({name = "subprocess", playback_only = false, args = {"/usr/bin/pbpaste"}, capture_stdout = true})
+    local txt = res.status == 0 and res.stdout or nil
 
-        -- If pbpaste has a URL or timestamp, use it immediately
-        if txt and (is_url(txt:match("^%s*(.-)%s*$")) or extract_timestamp(txt)) then
+    if txt then
+        local trimmed = txt:match("^%s*(.-)%s*$")
+        if is_url(trimmed) or extract_timestamp(trimmed) or trimmed:sub(1, 9) == "#MBSTREAM" then
             return txt
         end
+    end
 
-        -- Check Finder file clipboard via AppleScript
-        local as_cmd = "osascript -e 'try' -e 'set clipItem to (the clipboard as «class furl»)' -e 'return POSIX path of clipItem' -e 'end try' 2>/dev/null"
-        handle = io.popen(as_cmd)
-        local path_res = handle and handle:read("*a")
-        if handle then handle:close() end
+    local as_cmd = "try\nset clipItem to (the clipboard as «class furl»)\nreturn POSIX path of clipItem\nend try"
+    local as_res = mp.command_native({name = "subprocess", playback_only = false, args = {"osascript", "-e", as_cmd}, capture_stdout = true})
+    local path_res = as_res.status == 0 and as_res.stdout or nil
 
-        if path_res and path_res:match("%S") then
-            return path_res:match("^%s*(.-)%s*$")
+    if path_res and path_res:match("%S") then
+        return path_res:match("^%s*(.-)%s*$")
+    end
+    return txt
+end
+
+local function parse_mbstream(raw)
+    if not raw then return nil end
+    local trimmed = raw:match("^%s*(.-)%s*$")
+    if trimmed:sub(1, 9) ~= "#MBSTREAM" then return nil end
+    local json_part = trimmed:sub(10):match("^%s*(.-)%s*$")
+    local ok, data = pcall(utils.parse_json, json_part)
+    if ok and data and data.url and data.url ~= "" then return data end
+    return nil
+end
+
+local function add_item(type, val, start_time)
+    local opt = start_time and ("start=" .. start_time) or nil
+    if mp.get_property_number("playlist-count", 0) == 0 then
+        mp.osd_message(string.format("Opening %s%s...", type, start_time and (" at " .. format_timestamp(start_time)) or ""))
+        if opt then
+            mp.commandv("loadfile", val, "replace", opt)
+        else
+            mp.commandv("loadfile", val, "replace")
         end
-
-        return txt
-    elseif device == "windows" then
-        local handle = io.popen("powershell -NoProfile -Command \"$c = (Get-Clipboard -Format FileDropList)[0]; if (-not $c) { $c = Get-Clipboard -Raw -Format Text }; [Console]::Write($c)\"")
-        local txt = handle and handle:read("*a")
-        if handle then handle:close() end
-        return txt
     else
-        local handle = io.popen(options.linux_paste_command)
-        local txt = handle and handle:read("*a")
-        if handle then handle:close() end
-        return txt
+        mp.osd_message(string.format("Added %s to playlist%s", type, start_time and (" (starts at " .. format_timestamp(start_time) .. ")") or ""))
+        if opt then
+            mp.commandv("loadfile", val, "append-play", opt)
+        else
+            mp.commandv("loadfile", val, "append-play")
+        end
     end
 end
 
@@ -126,6 +145,15 @@ local function paste()
     local clip = get_clipboard()
     if not clip then
         mp.osd_message("Could not read clipboard", 2)
+        return
+    end
+
+    local mb = parse_mbstream(clip)
+    if mb then
+        if mb.ref and mb.ref ~= "" then mp.set_property("referrer", mb.ref) end
+        if mb.ua and mb.ua ~= "" then mp.set_property("user-agent", mb.ua) end
+        local url_time = extract_url_timestamp(mb.url)
+        add_item("URL", mb.url, url_time)
         return
     end
 
@@ -138,21 +166,12 @@ local function paste()
     local clean_path = normalize_path(clip)
     local seconds = extract_timestamp(clip)
 
-    local function add_item(type, val)
-        if mp.get_property_number("playlist-count", 0) == 0 then
-            mp.osd_message("Opening " .. type .. "...")
-            mp.commandv("loadfile", val, "replace")
-        else
-            mp.osd_message("Added " .. type .. " to playlist")
-            mp.commandv("loadfile", val, "append-play")
-        end
-    end
-
     if seconds then
         mp.osd_message("Seeking to: " .. clip, 2)
         mp.commandv("seek", seconds, "absolute", "exact")
     elseif is_url(clip) then
-        add_item("URL", clip)
+        local url_time = extract_url_timestamp(clip)
+        add_item("URL", clip, url_time)
     elseif file_exists(clean_path) then
         add_item("file", clean_path)
     else
@@ -161,8 +180,18 @@ local function paste()
 end
 
 local function copy()
+    local sub = mp.get_property("sub-text")
+    if sub and sub:match("%S") then
+        set_clipboard(sub:gsub("\n", " "))
+        mp.osd_message("Copied subtitle")
+        return
+    end
+
     local path = mp.get_property("path")
-    if not path then return end
+    if not path then 
+        mp.osd_message("Nothing to copy")
+        return 
+    end
     path = path:match("^%s*(.-)%s*$")
 
     local is_yt = path:match("youtube%.com") or path:match("youtu%.be")
@@ -171,16 +200,22 @@ local function copy()
     if is_u and not is_yt then
         local ua = mp.get_property("user-agent", "Mozilla/5.0")
         local ref = mp.get_property("referrer", "")
-        local ua_str = string.format('--user-agent "%s"', ua)
-        local ref_str = ref ~= "" and string.format('--referer "%s"', ref) or ""
-        path = string.format('yt-dlp -q --impersonate chrome --cookies-from-browser "chrome:~/Library/Application Support/Google/Chrome Beta" %s %s -o - "%s" | mpv --force-seekable=yes --cache=yes --demuxer-max-bytes=60M --demuxer-max-back-bytes=50M -', ua_str, ref_str, path)
-        path = path:gsub("%s+", " ")
-        mp.osd_message("Copied yt-dlp command")
-    elseif is_u and options.copy_youtube_timestamp then
-        path = path:gsub("([&?])t=%d+", function(s) return s == "?" and "?" or "" end):gsub("[?&]$", "")
+        
+        local payload = { url = path, ua = ua, ref = ref }
+        local json_str, err = utils.format_json(payload)
+        
+        if json_str then
+            path = "#MBSTREAM\n" .. json_str
+            mp.osd_message("Copied Stream for mpv")
+        else
+            mp.osd_message("Failed to format stream")
+            return
+        end
+    elseif is_u and options.copy_timestamped_url then
+        path = path:gsub("([&?])t=[%d%.]+", function(s) return s == "?" and "?" or "" end):gsub("[?&]$", "")
         local t = mp.get_property_number("time-pos", 0)
         if t > 0 then path = path .. (path:find("?") and "&" or "?") .. "t=" .. math.floor(t) end
-        mp.osd_message("Copied YouTube URL")
+        mp.osd_message("Copied Timestamped URL")
     else
         mp.osd_message("Copied path")
     end
@@ -188,33 +223,19 @@ local function copy()
     set_clipboard(path)
 end
 
-local function open_current()
-    local path = mp.get_property("path")
-    if not path then return end
-    local args
-    if is_url(path) then
-        if device == "windows" then args = { "powershell", "start", path }
-        elseif device == "mac" then args = { "/usr/bin/open", path }
-        else args = { "xdg-open", path } end
-    else
-        if device == "windows" then args = { "explorer", "/select,", path }
-        elseif device == "mac" then args = { "/usr/bin/open", "-a", "Finder", "-R", path }
-        else args = { "dbus-send", "--print-reply", "--dest=org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowItems", "array:string:file://" .. path, "string:" } end
+local function copy_timestamp()
+    local t = mp.get_property_number("time-pos")
+    if not t then
+        mp.osd_message("No video playing", 2)
+        return
     end
-    mp.command_native_async({ name = "subprocess", args = args })
-end
-
-local function copy_sub()
-    local sub = mp.get_property("sub-text")
-    if sub and sub ~= "" then
-        set_clipboard(sub:gsub("\n", " "))
-        mp.osd_message("Copied subtitle")
-    else
-        mp.osd_message("No subtitle to copy")
-    end
+    local ts = format_timestamp(t)
+    set_clipboard(ts)
+    mp.osd_message("Copied timestamp: " .. ts, 2)
 end
 
 bind_keys(options.copy_keybind, "copy", copy)
 bind_keys(options.paste_keybind, "paste", paste)
-bind_keys(options.copy_sub_keybind, "copy_sub", copy_sub)
-mp.add_forced_key_binding(options.open_keybind, "open_current", open_current)
+bind_keys(options.copy_timestamp_keybind, "copy_timestamp", copy_timestamp)
+
+mp.register_script_message("copy-timestamp", copy_timestamp)

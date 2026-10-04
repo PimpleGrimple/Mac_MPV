@@ -1,6 +1,3 @@
--- Save inside ~/mpv-scripts/subskip.lua
--- FINAL: Flawless Original Speed + Pure Instant Seek
-
 local cfg = {
 	default_state = false,
 	seek_mode_default = false,

@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Sockets and temp files
+*.sock
+mpv-socket
+cache/
+*.log
+/tmp/
+
+# Archives and custom builds
+archive/
+custom-build-*/

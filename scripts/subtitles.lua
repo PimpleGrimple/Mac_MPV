@@ -1,894 +1,834 @@
 --[[
     subtitles.lua
-
-    Merges three separate scripts into one, so a single keybind gets you
-    the right kind of subtitles/lyrics no matter what's playing:
-
-      - YouTube video   -> auto-generated captions   (was ytsub.lua)
-      - Audio/music     -> synced lyrics              (was autolyrics.lua)
-      - Local video      -> downloaded subtitles       (was autosub.lua, via Subliminal)
-
-    Sources merged (full credit / original logic preserved):
-      * autolyrics.lua by zydezu - https://github.com/zydezu/mpvconfig
-      * ytsub.lua by zydezu, forked from https://github.com/Idlusen/mpv-ytsub
-      * autosub.lua (Subliminal-based autosub script)
-
-    All original manual keybindings and automatic-on-load behaviour are kept,
-    so nothing about the old workflow breaks - there's just one new keybind
-    (smart_binding, default "ctrl+s") that picks the right one automatically.
-
-    NOTE ON script-opts: since all three scripts' options are now merged into
-    one file, the option names below have gained prefixes to avoid clashes
-    (e.g. autolyrics' "download_for_all" is now "lyrics_download_for_all").
-    If you had a script-opts/autolyrics.conf, ytsub.conf, etc. rename it to
-    script-opts/subtitles.conf and update the keys accordingly.
+    Hardened auto-subtitles & auto-lyrics engine.
+    Requires mpv >= 0.33 (uses utils.file_info).
 --]]
 
-mp.utils = require("mp.utils")
-mp.input = require("mp.input")
+local mp = require("mp")
+local utils = require("mp.utils")
+local options = require("mp.options")
 
--- optionally import a module, returning nil instead of erroring if it's missing
-local function want(name)
-    local out
-    if xpcall(function() out = require(name) end, function(e) out = e end) then
-        return out      -- success
-    else
-        return nil, out -- error
-    end
-end
-
-local http = want("socket.http")
-local https = want("ssl.https")
-
-------------------------------------------------------------------
--- OPTIONS
-------------------------------------------------------------------
-local options = {
-    -- === smart dispatcher ===
-    smart_binding = "4",           -- one keybind: picks lyrics / subs / yt-captions automatically
-
-    -- === lyrics (from autolyrics.lua) ===
-    musixmatch_token = "2501192ac605cc2e16b6b2c04fe43d1011a38d919fe802976084e7",
-    lyrics_download_for_all = false,    -- try to get lyrics for music without metadata
-    lyrics_load_for_youtube = false,     -- try to load lyrics on youtube videos
-    lyrics_store_separate = false,       -- store lyrics in lyrics_store instead of next to the file
-    lyrics_store = "~~/cache/scripts/lyrics/",
-    lyrics_strip_artists = true,        -- remove lines with artist names from NetEase lyrics
-    lyrics_cache_loading = true,        -- try to load lyrics that were already downloaded
-    lyrics_run_automatically = false,   -- run lyric lookup without pressing a key
-    lyrics_musixmatch_binding = "alt+m",
-    lyrics_lrclib_binding = "alt+n",
-    lyrics_offset_binding = "alt+o",
-
-    -- === subtitles via Subliminal (from autosub.lua) ===
-    subliminal_path = "/Users/mahmoud/.local/bin/subliminal",
-    sub_auto = false,                   -- automatically download subs, no hotkey required
-    sub_debug = false,                  -- use --debug in subliminal command
-    sub_force = false,                  -- force download; overwrite existing subtitle files
-    sub_utf8 = true,                    -- save all subtitle files as UTF-8
-    sub_download_binding = "q",         -- NOTE: shadows mpv's default "quit-watch-later" binding
-    sub_download2_binding = "n",        -- manually download the 2nd preferred language
-
-    -- === YouTube auto-subs (from ytsub.lua) ===
-    yt_source_lang = "en",              -- secondary language to load alongside the original
-    yt_autoload_on_start = false,       -- automatically load auto-subs when a video starts
-    yt_filter_sub_single_line = true,   -- remove duplicate/overlapping lines from auto-subs
-    yt_select_binding = "alt+y",        -- interactively pick which auto-sub language to load
-    yt_autoload_binding = "alt+Y",      -- load original + yt_source_lang auto-subs immediately
-    yt_cache_dir = "~/.cache/ytsub/",
-}
-require("mp.options").read_options(options)
-
-options.yt_cache_dir = mp.command_native({ "expand-path", options.yt_cache_dir })
-
--- Subliminal language preference order: { 'Name', 'ISO-639-1', 'ISO-639-2' }
--- If subtitles are found for the first language, other languages are not tried,
--- so put your preferred language first.
-local sub_languages = {
-    { 'English', 'en', 'eng' },
-    { 'Japanese', 'ja', 'jpn' },
-    -- { 'Arabic', 'ar', 'ara' },
-    -- { 'French', 'fr', 'fre' },
-    -- { 'Spanish', 'es', 'spa' },
-    -- { 'German', 'de', 'ger' },
-}
-
--- Optional provider logins for Subliminal, e.g.:
--- { '--opensubtitles', 'USERNAME', 'PASSWORD' },
-local sub_logins = {
-}
-
--- Paths excluded from Subliminal auto-downloading (substring or full path match)
-local sub_excludes = {
-    'no-subs-dl',
-}
-
--- If non-empty, ONLY these paths get Subliminal auto-downloading
-local sub_includes = {
-}
-
-------------------------------------------------------------------
--- SHARED HELPERS
-------------------------------------------------------------------
-
--- Generic logger: always prints to terminal, optionally shows OSD
-local function log(message, secs, osd)
-    secs = secs or 2.5
-    mp.msg.warn(message)
-    if osd ~= false then
-        mp.osd_message(message, secs)
-    end
-end
-
-local function create_dir(path)
-    local args
-    if package.config:sub(1, 1) == '\\' then
-        local win_path = path:gsub("/", "\\")
-        args = { "cmd", "/c", "mkdir", win_path }
-    else
-        args = { "mkdir", "-p", path }
-    end
-
-    local res = mp.command_native({ name = "subprocess", args = args, playback_only = false })
-    if res.status == 0 then
-        mp.msg.info("Successfully created folder: " .. path)
-    else
-        mp.msg.error("Failed to create folder: " .. path)
-    end
-end
-
-------------------------------------------------------------------
--- LYRICS (autolyrics.lua)
-------------------------------------------------------------------
-
-local lyrics_manual_run = false
-local lyrics_got_lyrics = false
-local lyrics_without_timestamps = false
-local lyrics_downloading_name = ""
-local lyrics_old_sub_count, lyrics_sub_count
-
-local function lyrics_error(message)
-    mp.msg.error(message)
-    if mp.get_property_native("vo-configured") and lyrics_manual_run then
-        mp.osd_message(message, 5)
-    end
-end
-
-local function lyrics_curl(args)
-    local r = mp.command_native({ name = "subprocess", capture_stdout = true, args = args })
-
-    if r.killed_by_us then
-        return false
-    end
-    if r.status < 0 then
-        lyrics_error("subprocess error: " .. r.error_string)
-        return false
-    end
-    if r.status > 0 then
-        lyrics_error("curl failed with code " .. r.status)
-        return false
-    end
-
-    local response, err = mp.utils.parse_json(r.stdout)
-    if err then
-        lyrics_error("Unable to parse the JSON response")
-        return false
-    end
-    return response
-end
-
-local function lyrics_get_metadata()
-    local metadata = mp.get_property_native("metadata")
-    local title, artist, album
-    if metadata then
-        if next(metadata) == nil then
-            mp.msg.info("Couldn't load metadata!")
-        else
-            title = metadata.title or metadata.TITLE or metadata.Title
-            if options.lyrics_download_for_all then
-                title = mp.get_property("media-title")
-                title = title:gsub("%b[]", "") .. " "
-            end
-            artist = mp.get_property("filtered-metadata/by-key/Artist") or mp.get_property("filtered-metadata/by-key/Album_Artist") or mp.get_property("filtered-metadata/by-key/Uploader")
-            if options.lyrics_download_for_all and not artist then
-                artist = " "
-            end
-            album = metadata.album or metadata.ALBUM or metadata.Album or ""
+local function add_to_package_path(path)
+    local expanded = mp.command_native({"expand-path", path})
+    if expanded and expanded ~= "" then
+        if not package.path:find(expanded, 1, true) then
+            package.path = expanded .. ";" .. package.path
         end
-    else
-        mp.msg.info("Couldn't load metadata!")
     end
+end
+add_to_package_path("~~/script-modules/?.lua")
+add_to_package_path("~~/scripts/?.lua")
 
-    if not title then
-        lyrics_error("This song has no title metadata")
-        return false
-    end
-    if not artist then
-        lyrics_error("This song has no artist metadata")
-        return false
-    end
+local user_input_loaded, user_input = pcall(require, "user-input-module")
 
-    local duration = mp.get_property_number("duration") or 0
-    return title, artist, album, duration
+local opts = {
+    musixmatch_token = "",
+    subliminal_path  = "subliminal",                           -- PATH lookup (or Homebrew / ~/.local/bin); override if you have a custom install
+
+    sub_download_binding            = "q",
+    sub_download_manual_binding     = "Q",
+    sub_download_alt_binding        = "ctrl+q",
+    sub_download_alt_manual_binding = "ctrl+Q",
+
+    auto_download          = false,
+    auto_download_delay    = 2,
+    download_to_tmp        = false,
+    clean_tmp_on_exit      = false,
+    min_sub_score          = 60,
+    hearing_impaired       = false,
+    max_workers            = 4,
+    providers              = "",
+    refiners               = "hash,metadata",
+    subtitle_cache_enabled = true,     -- Reuse successful Subliminal results per media file
+    debug                  = false,
+}
+options.read_options(opts)
+
+------------------------------------------------------------------
+-- Logging
+------------------------------------------------------------------
+local function log_info(msg, dur)
+    mp.msg.info("[subs] " .. msg)
+    if dur then mp.osd_message(msg, dur) end
+end
+local function log_warn(msg, dur)
+    mp.msg.warn("[subs] " .. msg)
+    if dur then mp.osd_message(msg, dur) end
+end
+local function log_debug(msg)
+    if opts.debug then mp.msg.info("[subs] " .. msg) end
 end
 
-local function lyrics_strip_artists(lyrics)
-    for _, pattern in pairs({ '作词', '作詞', '作曲', '制作人', '编曲', '編曲', '詞', '曲' }) do
-        lyrics = lyrics:gsub('%[[%d:%.]*] ?' .. pattern .. ' ?[:：] ?.-\n', '')
+------------------------------------------------------------------
+-- Utilities
+------------------------------------------------------------------
+local function nonempty(s)
+    return (type(s) == "string" and s:match("%S+")) and s or nil
+end
+
+local function sanitize_filename(name)
+    if not name then return "" end
+    local s = name:gsub("[\\/:%*%?\"<>|]", " "):gsub("%s+", " "):match("^%s*(.-)%s*$") or ""
+    if #s > 200 then
+        local tail = tostring(os.time()):sub(-6)
+        s = s:sub(1, 190) .. "_" .. tail
+    end
+    return s
+end
+
+local function is_stream_path(path)
+    if not path or path == "" or path == "fd://0" or path:find("^pipe:") then return true end
+    return path:match("^[%a][%w+.-]*://") ~= nil and not path:match("^file://")
+end
+
+local function file_exists(path)
+    if utils.file_info then return utils.file_info(path) ~= nil end
+    local f = io.open(path, "r"); if f then f:close(); return true end
+    return false
+end
+
+local function get_subliminal_bin()
+    local path = opts.subliminal_path
+    if path and path ~= "" and path ~= "subliminal" then
+        return mp.command_native({ "expand-path", path })
+    end
+    local home = os.getenv("HOME") or ""
+    local candidates = {
+        "/opt/homebrew/bin/subliminal",
+        home .. "/.local/bin/subliminal",
+        "/usr/local/bin/subliminal",
+    }
+    for _, c in ipairs(candidates) do
+        if file_exists(c) then return c end
+    end
+    return "subliminal"
+end
+
+local function ensure_dir(path)
+    if not path or path == "" then return false end
+    if utils.file_info then
+        local info = utils.file_info(path)
+        if info and info.is_dir then return true end
+    end
+    local res = utils.subprocess({ args = { "mkdir", "-p", path }, playback_only = false })
+    return res and res.status == 0
+end
+
+local function clean_dir(path)
+    if not path or path == "" then return end
+    if utils.file_info then
+        local info = utils.file_info(path)
+        if not info then return end
+    end
+    utils.subprocess({ args = { "rm", "-rf", path }, playback_only = false })
+end
+
+local function writable_dir(dir)
+    if not dir or dir == "" then return false end
+    local test = utils.join_path(dir, ".mpv-write-" .. tostring(os.time()) .. "-" .. tostring(math.random(1,1e6)))
+    local f = io.open(test, "w")
+    if not f then return false end
+    f:close()
+    os.remove(test)
+    return true
+end
+
+local function get_file_hash(filepath)
+    local res = utils.subprocess({ args = { "md5", "-q", filepath }, capture_stdout = true })
+    if res.status ~= 0 or not res.stdout then return nil end
+    local hex = res.stdout:match("(%x+)")
+    return hex and hex:lower() or nil
+end
+
+local function move_file(source, destination)
+    -- Prefer mpv's rename (single syscall, cross-fs safe)
+    if utils.rename then
+        local ok, err = utils.rename(source, destination)
+        if ok then return true end
+        log_debug("utils.rename failed: " .. tostring(err))
+    end
+    -- Fallback: libc rename
+    local ok, err = os.rename(source, destination)
+    if ok then return true end
+    -- Last resort: /bin/mv (handles cross-device moves)
+    local res = utils.subprocess({
+        args = { "/bin/mv", "-f", source, destination },
+        capture_stdout = true, capture_stderr = true,
+    })
+    if res.status == 0 then return true end
+    return false, err or res.stderr
+end
+
+local function has_video_track()
+    for _, t in ipairs(mp.get_property_native("track-list", {})) do
+        if t.type == "video" and not t.image and not t.albumart then return true end
+    end
+    return false
+end
+
+local language_aliases = {
+    en = { "en", "eng", "english" },
+    ja = { "ja", "jpn", "japanese" },
+    es = { "es", "spa", "spanish" },
+    fr = { "fr", "fra", "fre", "french" },
+}
+
+local function language_value_matches(value, lang_code)
+    if not value then return false end
+    value = value:lower()
+    for _, alias in ipairs(language_aliases[lang_code] or { lang_code }) do
+        if value == alias
+            or value:match("[^%a]" .. alias .. "[^%a]")
+            or value:match("^" .. alias .. "[^%a]")
+            or value:match("[^%a]" .. alias .. "$")
+        then
+            return true
+        end
+    end
+    return false
+end
+
+local function has_loaded_subtitle(lang_code)
+    for _, t in ipairs(mp.get_property_native("track-list", {})) do
+        if t.type == "sub" then
+            if not lang_code then return true end
+            if language_value_matches(t.lang, lang_code)
+                or language_value_matches(t.title, lang_code)
+                or language_value_matches(t["external-filename"], lang_code)
+            then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function prune_stale_tmp()
+    local dirs = utils.readdir("/tmp", "dirs")
+    if type(dirs) ~= "table" then return end
+    local now = os.time()
+    for _, d in ipairs(dirs) do
+        if d:match("^mpv%-subs%-%d+$") then
+            local full = "/tmp/" .. d
+            local info = utils.file_info and utils.file_info(full)
+            local mt = info and info.mtime
+            if mt and (now - mt) > 86400 then
+                log_debug("Pruning stale temp: " .. full)
+                clean_dir(full)
+            end
+        end
+    end
+end
+
+------------------------------------------------------------------
+-- Global state
+------------------------------------------------------------------
+local pid = mp.get_property_number("pid") or os.time()
+local file_generation = 0
+
+local job_counter = 0
+local active_job_id = nil
+local active_async_handle = nil
+
+local lyrics_request_counter = 0
+local active_lyrics_request_id = nil
+local active_lyrics_async_handle = nil
+
+local download_count = 0
+local alt_lang_index = 1
+local auto_dl_timer = nil
+local seen_sub_hashes = {}
+
+local sub_exts = { "srt", "ass", "ssa", "vtt", "idx", "sub", "smi", "mpl2" }
+
+local primary_lang = { 'English', 'en' }
+local alt_languages = {
+    { 'Japanese', 'ja' },
+    { 'Spanish', 'es' },
+    { 'French', 'fr' },
+}
+
+------------------------------------------------------------------
+-- Cancellation
+------------------------------------------------------------------
+local function cancel_auto_download()
+    if auto_dl_timer then
+        auto_dl_timer:kill()
+        auto_dl_timer = nil
+    end
+end
+
+local function abort_active_job()
+    cancel_auto_download()
+    if active_async_handle then
+        mp.abort_async_command(active_async_handle)
+        active_async_handle = nil
+    end
+    if active_lyrics_async_handle then
+        mp.abort_async_command(active_lyrics_async_handle)
+        active_lyrics_async_handle = nil
+    end
+    active_job_id = nil
+    active_lyrics_request_id = nil
+end
+
+local function finish_lyrics_request(req_id)
+    if active_lyrics_request_id == req_id then
+        active_lyrics_request_id = nil
+        active_lyrics_async_handle = nil
+    end
+end
+
+------------------------------------------------------------------
+-- Async HTTP
+------------------------------------------------------------------
+local function fetch_json_async(url, extra_args, headers, req_gen, req_id, callback)
+    local args = {
+        "curl", "-fsS",
+        "-A", "Mozilla/5.0 (mpv-subtitles/1.0)",
+        "--connect-timeout", "5",
+        "--max-time", "12",
+        "--retry", "2", "--retry-delay", "1",
+        "--get", url,
+    }
+    for _, h in ipairs(headers or {}) do
+        table.insert(args, "-H"); table.insert(args, h)
+    end
+    for _, v in ipairs(extra_args or {}) do table.insert(args, v) end
+
+    active_lyrics_async_handle = mp.command_native_async({
+        name = "subprocess", args = args, capture_stdout = true
+    }, function(success, res, err)
+        local is_current = (active_lyrics_request_id == req_id)
+        if is_current then active_lyrics_async_handle = nil end
+        if req_gen ~= file_generation or not is_current then return end
+        if not success or not res or res.status ~= 0 or not nonempty(res.stdout) then
+            return callback(nil)
+        end
+        local data, parse_err = utils.parse_json(res.stdout)
+        callback(not parse_err and data or nil)
+    end)
+end
+
+------------------------------------------------------------------
+-- Lifecycle
+------------------------------------------------------------------
+local function cleanup_tmp()
+    abort_active_job()
+    if opts.clean_tmp_on_exit then
+        clean_dir(utils.join_path("/tmp", "mpv-subs-" .. tostring(pid)))
+    end
+end
+
+local schedule_auto_download
+
+mp.register_event("file-loaded", function()
+    file_generation = file_generation + 1
+    abort_active_job()
+
+    download_count = 0
+    alt_lang_index = 1
+    seen_sub_hashes = {}
+
+    if opts.auto_download then schedule_auto_download() end
+end)
+
+mp.register_event("shutdown", cleanup_tmp)
+
+prune_stale_tmp()
+
+------------------------------------------------------------------
+-- Lyrics engine
+------------------------------------------------------------------
+local function get_metadata(manual_query)
+    local m = mp.get_property_native("metadata") or {}
+    local raw_media_title = mp.get_property("media-title") or ""
+
+    local title  = nonempty(m.title) or nonempty(m.TITLE) or nonempty(m.Title)
+                   or nonempty(raw_media_title:gsub("%b[]", ""))
+                   or "Unknown Title"
+    local artist = nonempty(mp.get_property("filtered-metadata/by-key/Artist"))
+                   or nonempty(mp.get_property("filtered-metadata/by-key/Uploader"))
+                   or nonempty(m.artist) or " "
+    local album  = nonempty(m.album) or nonempty(m.ALBUM) or nonempty(m.Album) or ""
+    local dur    = mp.get_property_number("duration") or 0
+
+    if manual_query then title = manual_query end
+    return title, artist, album, dur
+end
+
+local function strip_lyric_meta(lyrics)
+    lyrics = lyrics:gsub("’", "'")
+    for _, p in ipairs({ '作词','作詞','作曲','制作人','编曲','編曲','詞','曲' }) do
+        lyrics = lyrics:gsub('%[[%d:%.]*] ?' .. p .. ' ?[:：] ?.-\n', '')
     end
     return lyrics
 end
 
-local function lyrics_save(lyrics)
-    if lyrics == "" or #lyrics < 100 then
-        lyrics_error("Lyrics not found")
-        return
-    end
+local function save_lyrics(lyrics, name, is_stream, path, req_gen, type_label, cache_filename)
+    if req_gen ~= file_generation then return false end
+    if not lyrics or #lyrics:gsub("%s", "") < 8 then return false end
+    type_label = type_label or "Lyrics"
+    lyrics = strip_lyric_meta(lyrics)
 
-    local current_sub_path = mp.get_property("current-tracks/sub/external-filename")
-
-    if current_sub_path and lyrics:find("^%[") == nil then
-        lyrics_error("Only lyrics without timestamps are available, so the existing LRC file won't be overwritten")
-        return
-    end
-
-    lyrics = lyrics:gsub("’", "'"):gsub("' ", "'"):gsub("\\", "")
-
-    if options.lyrics_strip_artists then
-        lyrics = lyrics_strip_artists(lyrics)
-    end
-
-    local function is_url(s)
-        local url_pattern = "^[%w]+://[%w%.%-_]+%.[%a]+[-%w%.%-%_/?&=]*"
-        return string.match(s, url_pattern) ~= nil
-    end
-
-    lyrics_downloading_name = lyrics_downloading_name:gsub("\\", " "):gsub("/", " ")
-
-    local path = mp.get_property("path")
-    local media = lyrics_downloading_name .. " [" .. mp.get_property("filename/no-ext") .. "]"
-    local pattern = '[\\/:*?"<>|]'
-
-    if (is_url(path) and path or nil) and options.lyrics_load_for_youtube then
-        local youtube_ID = ""
-        if not lyrics_downloading_name then
-            youtube_ID = " [" .. mp.get_property("filename"):match("[?&]v=([^&]+)") .. "]"
-        end
-        local filename = string.gsub(media:sub(1, 100):gsub(pattern, ""), "^%s*(.-)%s*$", "%1") .. youtube_ID
-        path = mp.command_native({ "expand-path", options.lyrics_store .. filename })
+    local base_dir = mp.command_native({ "expand-path", opts.lyrics_store })
+    local lrc_path
+    if is_stream then
+        lrc_path = utils.join_path(base_dir, cache_filename)
     else
-        if options.lyrics_store_separate then
-            path = mp.command_native({ "expand-path", options.lyrics_store .. media })
+        local sidecar = path:gsub("%?", "") .. ".lrc"
+        local dir = sidecar:match("(.+[\\/])")
+        if dir and writable_dir(dir) then
+            lrc_path = sidecar
+        else
+            lrc_path = utils.join_path(base_dir, cache_filename)
         end
     end
 
-    local lrc_path = (path:gsub("?", "") .. ".lrc")
-    local dir_path = lrc_path:match("(.+[\\/])")
+    local dir = lrc_path:match("(.+[\\/])")
+    if dir then ensure_dir(dir) end
 
-    if mp.utils.readdir(dir_path) == nil and options.lyrics_store_separate then
-        create_dir(dir_path)
+    local f, err = io.open(lrc_path, "w")
+    if not f then
+        log_warn("Failed to write lyrics: " .. tostring(err), 2)
+        return false
     end
+    f:write(lyrics); f:close()
 
-    local lrc = io.open(lrc_path, "w")
-    if lrc == nil then
-        lyrics_error("Failed writing to " .. lrc_path)
-        return
-    end
-    lrc:write(lyrics)
-    lrc:close()
-
-    if lyrics:find("^%[") then
-        mp.command(current_sub_path and "sub-reload" or "rescan-external-files")
-        if lyrics_manual_run then
-            mp.osd_message("Lyrics downloaded")
-        end
-        lyrics_got_lyrics = true
-        lyrics_without_timestamps = false
-    else
-        if lyrics_manual_run then
-            mp.osd_message("Lyrics without timestamps downloaded")
-        end
-        lyrics_without_timestamps = true
-    end
+    mp.commandv("sub-add", lrc_path, "select", type_label)
+    mp.osd_message("", 0)
+    log_info(type_label .. " downloaded", 2)
+    return true
 end
 
-local function lyrics_musixmatch_download()
-    local title, artist, album, duration = lyrics_get_metadata()
-    if not title then return end
+local function download_lyrics(manual_query)
+    abort_active_job()
 
-    mp.msg.info("Fetching lyrics (musixmatch)")
-    if lyrics_manual_run then
-        mp.osd_message("Fetching lyrics (musixmatch)")
+    lyrics_request_counter = lyrics_request_counter + 1
+    local req_id = lyrics_request_counter
+    active_lyrics_request_id = req_id
+
+    local req_gen = file_generation
+    local title, artist, album, dur = get_metadata(manual_query)
+    if not title then return log_warn("Metadata missing", 2) end
+
+    local path = mp.get_property("path") or ""
+    local is_stream = is_stream_path(path)
+
+    local dur_sec = math.floor(dur + 0.5)
+    local album_tag = nonempty(album) and (" - " .. album) or ""
+    local cache_file_name = sanitize_filename(artist .. " - " .. title .. album_tag .. " - " .. dur_sec .. "s") .. ".lrc"
+    local base_dir = mp.command_native({ "expand-path", opts.lyrics_store })
+    local local_lrc_path = is_stream
+        and utils.join_path(base_dir, cache_file_name)
+        or (path:gsub("%?", "") .. ".lrc")
+
+    if not manual_query and file_exists(local_lrc_path) then
+        mp.commandv("sub-add", local_lrc_path, "cached", "Cached Lyrics")
+        finish_lyrics_request(req_id)
+        return log_info("Loaded lyrics from local cache", 2)
     end
-    mp.msg.info("Requesting: " .. title .. " - " .. artist)
 
-    local response = lyrics_curl({
-        "curl",
-        "--silent",
-        "--get",
-        "--cookie", "x-mxm-token-guid=" .. options.musixmatch_token,
-        "https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get",
+    log_info("Searching lyrics...", 30)
+
+    local function search_lrclib()
+        fetch_json_async("https://lrclib.net/api/get", {
+            "--data-urlencode", "track_name=" .. title,
+            "--data-urlencode", "artist_name=" .. artist,
+            "--data-urlencode", "album_name=" .. album,
+            "--data-urlencode", "duration=" .. dur,
+        }, { "Lrclib-Client: mpv-subtitles/1.0" }, req_gen, req_id, function(lrc)
+            if req_gen ~= file_generation then return end
+            if lrc then
+                if lrc.instrumental then
+                    finish_lyrics_request(req_id)
+                    return log_info("LRCLIB: track is instrumental", 2)
+                end
+                if lrc.syncedLyrics then
+                    if save_lyrics(lrc.syncedLyrics,
+                        (lrc.artistName or artist) .. " - " .. (lrc.trackName or title),
+                        is_stream, path, req_gen, "LRCLIB (Synced)", cache_file_name) then
+                        finish_lyrics_request(req_id); return
+                    end
+                elseif lrc.plainLyrics then
+                    if save_lyrics(lrc.plainLyrics,
+                        (lrc.artistName or artist) .. " - " .. (lrc.trackName or title),
+                        is_stream, path, req_gen, "LRCLIB (Plain)", cache_file_name) then
+                        finish_lyrics_request(req_id); return
+                    end
+                end
+            end
+            finish_lyrics_request(req_id)
+            log_warn("Lyrics not found", 2)
+        end)
+    end
+
+    if not nonempty(opts.musixmatch_token) then return search_lrclib() end
+
+    -- Musixmatch is best-effort with a shorter timeout so LRCLIB still gets a turn
+    local mxm_args = {
+        "curl", "-fsS", "-A", "Mozilla/5.0",
+        "--connect-timeout", "4", "--max-time", "6",
+        "--get", "https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get",
+        "--cookie", "x-mxm-token-guid=" .. opts.musixmatch_token,
         "--data", "app_id=web-desktop-app-v1.0",
-        "--data", "usertoken=" .. options.musixmatch_token,
+        "--data", "usertoken=" .. opts.musixmatch_token,
         "--data-urlencode", "q_track=" .. title,
         "--data-urlencode", "q_artist=" .. artist,
-    })
+    }
 
-    if not response then return end
-
-    if response.message.header.status_code == 401 and response.message.header.hint == "renew" then
-        lyrics_error("The Musixmatch token has been rate limited - https://github.com/guidocella/mpv-lrc >>> script-opts/lrc.conf explains how to generate a new one.")
-        return
-    end
-
-    if response.message.header.status_code ~= 200 then
-        lyrics_error("Request failed with status code " .. response.message.header.status_code .. ". Hint: " .. response.message.header.hint)
-        return
-    end
-
-    local lyrics = ""
-    local body = response and response.message and response.message.body and response.message.body.macro_calls
-    if not body then
-        lyrics_error("Invalid response structure: macro_calls not found")
-        return
-    end
-    local matcher = body["matcher.track.get"]
-    if not matcher or not matcher.message or not matcher.message.header then
-        lyrics_error("Invalid matcher.track.get structure")
-        return
-    end
-
-    if matcher.message.header.status_code == 200 then
-        local track = matcher.message.body and matcher.message.body.track
-        if not track or not track.artist_name or not track.track_name then
-            lyrics_error("Track data missing")
-            return
+    active_lyrics_async_handle = mp.command_native_async({
+        name = "subprocess", args = mxm_args, capture_stdout = true
+    }, function(success, res, err)
+        local is_current = (active_lyrics_request_id == req_id)
+        if is_current then active_lyrics_async_handle = nil end
+        if req_gen ~= file_generation or not is_current then return end
+        if not success or not res or res.status ~= 0 or not nonempty(res.stdout) then
+            return search_lrclib()
         end
-        lyrics_downloading_name = track.artist_name .. " - " .. track.track_name
+        local mxm = utils.parse_json(res.stdout)
+        if not mxm then return search_lrclib() end
 
-        if track.has_subtitles == 1 then
-            local subtitles = body["track.subtitles.get"]
-            if subtitles and subtitles.message and subtitles.message.body then
-                local subtitle_list = subtitles.message.body.subtitle_list
-                if subtitle_list and subtitle_list[1] and subtitle_list[1].subtitle then
-                    lyrics = subtitle_list[1].subtitle.subtitle_body or ""
-                else
-                    lyrics_error("Subtitles data is malformed")
+        local msg  = mxm.message
+        local hdr  = msg and msg.header
+        local body = msg and msg.body
+        local calls = body and body.macro_calls
+        local matcher = calls and calls["matcher.track.get"]
+        local m_body  = matcher and matcher.message and matcher.message.body
+        local tr      = m_body and m_body.track
+
+        local duration_match = true
+        if tr and tr.track_length and dur > 0 and math.abs(tr.track_length - dur) > 15 then
+            duration_match = false
+        end
+
+        if hdr and hdr.status_code == 200 and tr and duration_match then
+            local txt, is_synced = "", false
+            if tr.has_subtitles == 1 and calls["track.subtitles.get"] then
+                local sub_list = calls["track.subtitles.get"].message.body.subtitle_list
+                if sub_list and sub_list[1] then
+                    txt = sub_list[1].subtitle.subtitle_body
+                    is_synced = true
                 end
-            else
-                lyrics_error("Subtitle data missing")
+            elseif tr.has_lyrics == 1 and calls["track.lyrics.get"] then
+                local l_body = calls["track.lyrics.get"].message.body.lyrics
+                if l_body then txt = l_body.lyrics_body end
             end
-        elseif track.has_lyrics == 1 then
-            local lyrics_data = body["track.lyrics.get"]
-            if lyrics_data and lyrics_data.message and lyrics_data.message.body and lyrics_data.message.body.lyrics then
-                lyrics = lyrics_data.message.body.lyrics.lyrics_body or ""
-            else
-                lyrics_error("Lyrics data is missing or malformed")
+
+            local label = is_synced and "Musixmatch (Synced)" or "Musixmatch (Plain)"
+            if txt ~= "" and save_lyrics(txt,
+                (tr.artist_name or artist) .. " - " .. (tr.track_name or title),
+                is_stream, path, req_gen, label, cache_file_name) then
+                finish_lyrics_request(req_id); return
             end
-        elseif track.instrumental == 1 then
-            lyrics_error("This is an instrumental track")
-            return
-        else
-            lyrics_error("No lyrics or subtitles found")
         end
-    end
-
-    lyrics_save(lyrics)
-end
-
-local function lyrics_lrclib_download()
-    local title, artist, album, duration = lyrics_get_metadata()
-    if not title or not artist or not album or not duration then return end
-
-    mp.osd_message('Fetching lyrics (lrclib.net)')
-
-    local response = lyrics_curl({
-        "curl",
-        "--silent",
-        "--get",
-        "https://lrclib.net/api/get",
-        "--data-urlencode", "track_name=" .. title,
-        "--data-urlencode", "artist_name=" .. artist,
-        "--data-urlencode", "album_name=" .. album,
-        "--data-urlencode", "duration=" .. duration,
-    })
-
-    if not response or not response.artistName or not response.trackName then return end
-
-    if response.instrumental == true then
-        lyrics_error("This is an instrumental track")
-        return
-    end
-
-    lyrics_downloading_name = response.artistName .. " - " .. response.trackName
-    lyrics_save(response.syncedLyrics)
-end
-
-local function lyrics_auto_download()
-    if lyrics_old_sub_count ~= lyrics_sub_count and options.lyrics_cache_loading then
-        print("Subs previously downloaded - not downloading again")
-    else
-        lyrics_got_lyrics = false
-        lyrics_musixmatch_download()
-        if not lyrics_got_lyrics then
-            lyrics_lrclib_download()
-        end
-        if lyrics_without_timestamps then
-            mp.osd_message("Lyrics without timestamps downloaded automatically")
-        end
-        if not lyrics_got_lyrics then
-            lyrics_error("Lyrics not found")
-        end
-    end
-end
-
-local function lyrics_get_sub_count()
-    local track_list = mp.get_property_native("track-list", {})
-    local sub_count = 0
-    for _, track in ipairs(track_list) do
-        if track["type"] == "sub" then
-            sub_count = sub_count + 1
-        end
-    end
-    return sub_count
-end
-
-local function lyrics_check_downloaded()
-    lyrics_old_sub_count, lyrics_sub_count = lyrics_get_sub_count(), nil
-
-    if lyrics_old_sub_count > 0 then
-        print("Subtitles detected - aborting lyrics lookup")
-        return
-    end
-
-    if options.lyrics_cache_loading then
-        local current_sub_path = mp.get_property("current-tracks/sub/external-filename")
-        mp.set_property("sub-file-paths", mp.command_native({ "expand-path", options.lyrics_store }))
-        mp.command(current_sub_path and "sub-reload" or "rescan-external-files")
-        lyrics_sub_count = lyrics_get_sub_count()
-    end
-
-    if options.lyrics_run_automatically then
-        lyrics_auto_download()
-    end
+        search_lrclib()
+    end)
 end
 
 ------------------------------------------------------------------
--- SUBTITLES VIA SUBLIMINAL (autosub.lua)
+-- Subtitles engine
 ------------------------------------------------------------------
-
-local sub_directory, sub_filename, sub_tracks
-
-local function sub_download(language)
-    language = language or sub_languages[1]
-    if #language == 0 then
-        log('No Language found\n')
-        return false
-    end
-
-    log('Searching ' .. language[1] .. ' subtitles ...', 30)
-
-    local cmd = { args = { options.subliminal_path } }
-    local a = cmd.args
-
-    for _, login in ipairs(sub_logins) do
-        a[#a + 1] = login[1]
-        a[#a + 1] = login[2]
-        a[#a + 1] = login[3]
-    end
-    if options.sub_debug then
-        a[#a + 1] = '--debug'
-    end
-
-    a[#a + 1] = 'download'
-    if options.sub_force then
-        a[#a + 1] = '-f'
-    end
-    if options.sub_utf8 then
-        a[#a + 1] = '-e'
-        a[#a + 1] = 'utf-8'
-    end
-
-    a[#a + 1] = '-l'
-    a[#a + 1] = language[2]
-    a[#a + 1] = '-d'
-    a[#a + 1] = sub_directory
-    a[#a + 1] = sub_filename
-
-    local result = mp.utils.subprocess(cmd)
-
-    if string.find(result.stdout, 'Downloaded 1 subtitle') then
-        mp.set_property('slang', language[2])
-        mp.commandv('rescan_external_files')
-        log(language[1] .. ' subtitles ready!')
-        return true
-    else
-        log('No ' .. language[1] .. ' subtitles found\n')
-        return false
+local function pick_free_target(target_dir, stem, lang, ext)
+    local n = 0
+    while true do
+        local suffix = n > 0 and ("_" .. n) or ""
+        local candidate = utils.join_path(target_dir, stem .. suffix .. "." .. lang .. "." .. ext)
+        if not file_exists(candidate) then return candidate, suffix end
+        n = n + 1
+        if n > 99 then return candidate, suffix end -- give up, just overwrite
     end
 end
 
-local function sub_download2()
-    sub_download(sub_languages[2])
-end
+local function download_subs(manual_query, target_lang)
+    abort_active_job()
 
-local function sub_allowed()
-    local duration = tonumber(mp.get_property('duration'))
-    local active_format = mp.get_property('file-format')
+    job_counter = job_counter + 1
+    local job_id = job_counter
+    active_job_id = job_id
 
-    if not options.sub_auto then
-        mp.msg.warn('Automatic downloading disabled!')
-        return false
-    elseif duration < 900 then
-        mp.msg.warn('Video is less than 15 minutes\n=> NOT auto-downloading subtitles')
-        return false
-    elseif sub_directory:find('^http') then
-        mp.msg.warn('Automatic subtitle downloading is disabled for web streaming')
-        return false
-    elseif active_format:find('^cue') then
-        mp.msg.warn('Automatic subtitle downloading is disabled for cue files')
-        return false
-    else
-        local not_allowed = { 'aiff', 'ape', 'flac', 'mp3', 'ogg', 'wav', 'wv', 'tta' }
-        for _, file_format in pairs(not_allowed) do
-            if file_format == active_format then
-                mp.msg.warn('Automatic subtitle downloading is disabled for audio files')
-                return false
-            end
-        end
+    local req_gen = file_generation
+    target_lang = target_lang or primary_lang
 
-        for _, exclude in pairs(sub_excludes) do
-            local escaped_exclude = exclude:gsub('%W', '%%%0')
-            if sub_directory:find(escaped_exclude) then
-                mp.msg.warn('This path is excluded from auto-downloading subs')
-                return false
-            end
-        end
-
-        for i, include in ipairs(sub_includes) do
-            local escaped_include = include:gsub('%W', '%%%0')
-            local included = sub_directory:find(escaped_include)
-            if included then
-                break
-            elseif i == #sub_includes then
-                mp.msg.warn('This path is not included for auto-downloading subs')
-                return false
-            end
-        end
-    end
-
-    return true
-end
-
-local function sub_should_download_in(language)
-    for i, track in ipairs(sub_tracks) do
-        local subtitles = track['external'] and 'subtitle file' or 'embedded subtitles'
-
-        if not track['lang'] and (track['external'] or not track['title']) and i == #sub_tracks then
-            local status = track['selected'] and ' active' or ' present'
-            log('Unknown ' .. subtitles .. status)
-            mp.msg.warn('=> NOT downloading new subtitles')
-            return false
-        elseif track['lang'] == language[3] or track['lang'] == language[2] or
-            (track['title'] and track['title']:lower():find(language[3])) then
-            if not track['selected'] then
-                mp.set_property('sid', track['id'])
-                log('Enabled ' .. language[1] .. ' ' .. subtitles .. '!')
-            else
-                log(language[1] .. ' ' .. subtitles .. ' active')
-            end
-            mp.msg.warn('=> NOT downloading new subtitles')
-            return false
-        end
-    end
-    mp.msg.warn('No ' .. language[1] .. ' subtitles were detected\n=> Proceeding to download:')
-    return true
-end
-
-local function sub_control_downloads()
-    mp.set_property('sub-auto', 'fuzzy')
-    mp.set_property('slang', sub_languages[1][2])
-    mp.msg.warn('Reactivate external subtitle files:')
-    mp.commandv('rescan_external_files')
-    sub_directory, sub_filename = mp.utils.split_path(mp.get_property('path'))
-
-    if not sub_allowed() then return end
-
-    sub_tracks = {}
-    for _, track in ipairs(mp.get_property_native('track-list')) do
-        if track['type'] == 'sub' then
-            sub_tracks[#sub_tracks + 1] = track
-        end
-    end
-    if options.sub_debug then
-        for _, track in ipairs(sub_tracks) do
-            mp.msg.warn('Subtitle track', track['id'], ':\n{')
-            for k, v in pairs(track) do
-                if type(v) == 'string' then v = '"' .. v .. '"' end
-                mp.msg.warn('  "' .. k .. '":', v)
-            end
-            mp.msg.warn('}\n')
-        end
-    end
-
-    for _, language in ipairs(sub_languages) do
-        if sub_should_download_in(language) then
-            if sub_download(language) then return end
-        else
-            return
-        end
-    end
-    log('No subtitles were found')
-end
-
-------------------------------------------------------------------
--- YOUTUBE AUTO-SUBS (ytsub.lua)
-------------------------------------------------------------------
-
-local function yt_error(message)
-    mp.msg.error(message)
-    mp.osd_message("ytsub: " .. message, 5)
-end
-
-local function yt_notify(message)
-    mp.msg.info(message)
-end
-
-local function yt_create_cache_dir()
-    local res = mp.utils.file_info(options.yt_cache_dir)
-    if res and res.is_dir then return end
-    create_dir(options.yt_cache_dir)
-end
-yt_create_cache_dir()
-
-local function yt_filter_sub(path)
-    local lines = {}
-    for line in io.lines(path) do
-        table.insert(lines, line)
-    end
-
-    local out = io.open(path, "w")
-    if out ~= nil then
-        for i, line in ipairs(lines) do
-            if i < 5 or i % 8 == 5 or i % 8 == 7 or i % 8 == 0 then
-                out:write(line, "\n")
-            end
-        end
-        out:close()
-    end
-end
-
-local function yt_load_autosub(lang, sub_info, ytid, is_primary, select_track)
-    if select_track == nil then select_track = true end
-    local lang_name, url
-
-    if sub_info ~= nil then
-        for _, v in pairs(sub_info) do
-            lang_name = v["name"]
-            if v["ext"] == "vtt" then
-                url = v["url"]
-            end
-        end
-    end
-    if lang_name == nil or url == nil then
-        yt_error("could not get lang name or url from sub info")
-        return
-    end
-
-    yt_notify("loading " .. lang_name)
-
-    local subfile_base = mp.utils.join_path(options.yt_cache_dir, ytid)
-    local subfile = subfile_base .. "." .. lang .. ".vtt"
-
-    local sub_is_available = false
-    local f = io.open(subfile, "r")
-    if f ~= nil then
-        io.close(f)
-        sub_is_available = true
-    else
-        if http ~= nil and https ~= nil then
-            local body, status = http.request(url)
-            if body ~= nil and status == 200 then
-                f = assert(io.open(subfile, "wb"))
-                f:write(body)
-                f:close()
-                sub_is_available = true
-            end
-        end
-
-        if not sub_is_available then
-            local ytdl_path = mp.get_property_native("user-data/mpv/ytdl/path")
-            if ytdl_path ~= nil then
-                mp.command_native({
-                    name = "subprocess",
-                    args = { ytdl_path, "--skip-download", "--sub-lang", lang, "--write-auto-sub", "-o", subfile_base, "--", ytid },
-                })
-                f = io.open(subfile, "r")
-                if f ~= nil then
-                    io.close(f)
-                    sub_is_available = true
-                end
-            end
-        end
-
-        if sub_is_available and options.yt_filter_sub_single_line then
-            yt_filter_sub(subfile)
-        end
-    end
-
-    if not sub_is_available then
-        yt_error("failed to download " .. lang_name)
-        return
-    end
-
-    if is_primary then
-        mp.command("sub-add " .. subfile .. " " .. (select_track and "select" or "auto") .. " 'auto-generated' '" .. lang .. "'")
-    elseif select_track then
-        local n_tracks = mp.get_property_native("track-list/count")
-        local n_subs = 0
-        for i = 0, n_tracks - 1 do
-            if mp.get_property_native("track-list/" .. i .. "/type") == "sub" then
-                n_subs = n_subs + 1
-            end
-        end
-        mp.command("sub-add " .. subfile .. " auto 'auto-generated' '" .. lang .. "'")
-        mp.set_property("secondary-sid", n_subs + 1)
-    else
-        mp.command("sub-add " .. subfile .. " auto 'auto-generated' '" .. lang .. "'")
-    end
-    yt_notify(lang_name .. " loaded")
-end
-
-local function yt_is_available()
-    return mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result") ~= nil
-end
-
-local function yt_download(is_auto, is_silent)
-    local ytdl_output = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result")
-    if ytdl_output == nil then
-        if not is_silent then yt_error("no ytdl info available") end
-        return
-    end
-
-    local j = mp.utils.parse_json(ytdl_output["stdout"])
-    local subs = j["automatic_captions"]
-    if subs == nil or next(subs) == nil then
-        if not is_silent then yt_error("no auto-subs found") end
-        return
-    end
-
-    if is_auto then
-        local source_lang = options.yt_source_lang
-
-        local has_real_subs = false
-        if j["subtitles"] ~= nil then
-            for k, _ in pairs(j["subtitles"]) do
-                if k ~= "live_chat" then
-                    has_real_subs = true
-                    break
-                end
-            end
-        end
-        local select_track = not has_real_subs
-
-        local orig_lang
-        for k, _ in pairs(subs) do
-            if string.find(k, "(orig)") ~= nil then
-                orig_lang = k
-                break
-            end
-        end
-
-        yt_load_autosub(orig_lang, subs[orig_lang], j["id"], true, select_track)
-        if source_lang ~= nil then
-            if orig_lang == source_lang .. "-orig" then
-                yt_notify("source language and original language are the same (" .. source_lang .. ")")
-            else
-                yt_load_autosub(source_lang, subs[source_lang], j["id"], false, select_track)
-            end
-        end
-    else
-        local langs = {}
-        for k, _ in pairs(subs) do
-            table.insert(langs, k)
-        end
-
-        mp.input.select({
-            prompt = "Select a language",
-            items = langs,
-            submit = function(lang_id) yt_load_autosub(langs[lang_id], subs[langs[lang_id]], j["id"], true) end,
-        })
-    end
-end
-
-------------------------------------------------------------------
--- SMART DISPATCHER - the one keybind
-------------------------------------------------------------------
-
-local function is_audio_only()
-    local track_list = mp.get_property_native("track-list", {})
-    local has_real_video = false
-    for _, track in ipairs(track_list) do
-        -- exclude album-art / cover-image "video" tracks
-        if track.type == "video" and not track.image and not track.albumart then
-            has_real_video = true
-        end
-    end
-    return not has_real_video
-end
-
-local function smart_subtitle_download()
     local path = mp.get_property("path") or ""
+    local is_stream = is_stream_path(path)
+    local media_dir = "/tmp"
+    local real_fname = "video.mkv"
 
-    if yt_is_available() then
-        log("Downloading YouTube captions...", 2.5)
-        yt_download(true, false)
-        return
+    if not is_stream then
+        media_dir, real_fname = utils.split_path(path)
+    else
+        local media_title = mp.get_property("media-title") or "stream_video"
+        real_fname = sanitize_filename(media_title) .. ".mkv"
     end
 
-    if is_audio_only() then
-        log("Fetching lyrics...", 2.5)
-        lyrics_manual_run = true
-        lyrics_auto_download()
-        return
+    -- Per-pid session dir, per-job scratch dir, and a session-scoped "kept"
+    -- dir for subs that must survive the per-job cleanup.
+    local session_tmp  = utils.join_path("/tmp", "mpv-subs-" .. tostring(pid))
+    local job_tmp_dir  = utils.join_path(session_tmp, "job-" .. tostring(job_id))
+    local keep_tmp_dir = utils.join_path(session_tmp, "kept")
+    ensure_dir(job_tmp_dir)
+    ensure_dir(keep_tmp_dir)
+
+    -- ------------------------------------------------------------------
+    -- Decide what to feed Subliminal.
+    --
+    -- Subliminal guesses title/season/episode from the *filename*, so the
+    -- input path must be named correctly. Three cases:
+    --
+    --   * Manual query  → user typed exactly what to search. Create a stub
+    --                     file with that name. Metadata-only refiners.
+    --   * Stream        → no local file. Create a stub from media-title.
+    --                     Metadata-only refiners.
+    --   * Local file    → point Subliminal at the real file so hash
+    --                     refiners can work.
+    -- ------------------------------------------------------------------
+    local input_target
+    local stub_created
+    local metadata_only = false
+
+    if manual_query then
+        -- Manual always wins: the user typed this because the auto name
+        -- was wrong or a specific release is wanted.
+        local clean = sanitize_filename(manual_query)
+        if clean == "" then clean = "video" end
+        if not clean:match("%.%w+$") then clean = clean .. ".mkv" end
+        input_target = utils.join_path(job_tmp_dir, clean)
+        local f = io.open(input_target, "w"); if f then f:close() end
+        stub_created = input_target
+        metadata_only = true
+    elseif is_stream then
+        local clean = real_fname
+        if not clean:match("%.%w+$") then clean = clean .. ".mkv" end
+        input_target = utils.join_path(job_tmp_dir, clean)
+        local f = io.open(input_target, "w"); if f then f:close() end
+        stub_created = input_target
+        metadata_only = true
+    else
+        input_target = path
     end
 
-    log("Downloading subtitles...", 2.5)
-    sub_directory, sub_filename = mp.utils.split_path(path)
-    sub_tracks = {}
-    for _, track in ipairs(mp.get_property_native("track-list", {})) do
-        if track["type"] == "sub" then
-            sub_tracks[#sub_tracks + 1] = track
+    -- Stem Subliminal uses for its output: <stem>.<lang>.<ext>
+    local search_stem = input_target:match("([^/\\]+)%.%w+$")
+                     or input_target:match("([^/\\]+)$")
+                     or "video"
+
+    -- Final on-disk name: for local files, always use the media's own name
+    -- so subs sit alongside the media consistently. For streams, name after
+    -- whatever we searched for so the tmp filename is meaningful.
+    local output_stem
+    if is_stream then
+        output_stem = search_stem
+    else
+        output_stem = real_fname:match("(.+)%.%w+$") or real_fname
+    end
+
+    log_info("Searching " .. target_lang[1] .. " subtitles...", 30)
+
+    local args = {
+        get_subliminal_bin(), "download",
+        "-e", "utf-8",
+        "-l", target_lang[2],
+        "-m", tostring(opts.min_sub_score),
+        "-w", tostring(opts.max_workers),
+        "-d", job_tmp_dir,
+    }
+
+    local active_refiners = metadata_only and "metadata" or opts.refiners
+    if nonempty(active_refiners) then
+        for ref in active_refiners:gmatch("[^,]+") do
+            table.insert(args, '-r'); table.insert(args, ref:match("^%s*(.-)%s*$"))
         end
     end
-    for _, language in ipairs(sub_languages) do
-        if sub_should_download_in(language) then
-            if sub_download(language) then return end
+    if nonempty(opts.providers) then
+        for prov in opts.providers:gmatch("[^,]+") do
+            table.insert(args, '-p'); table.insert(args, prov:match("^%s*(.-)%s*$"))
+        end
+    end
+    if opts.hearing_impaired then table.insert(args, '-hi') end
+    table.insert(args, input_target)
+
+    log_debug("subliminal cmd: " .. table.concat(args, " "))
+
+    active_async_handle = mp.command_native_async({
+        name = "subprocess", args = args,
+        capture_stdout = true, capture_stderr = true,
+    }, function(success, res, err)
+        local is_current_job = (active_job_id == job_id)
+        if stub_created then os.remove(stub_created) end
+        if is_current_job then
+            active_job_id = nil
+            active_async_handle = nil
+        end
+
+        if req_gen ~= file_generation or not is_current_job then
+            clean_dir(job_tmp_dir); return
+        end
+        if not success or not res then
+            clean_dir(job_tmp_dir)
+            local why = err and tostring(err) or "unknown"
+            return log_warn("Subliminal failed to run (" .. why
+                .. "). Check subliminal_path in script-opts/subtitles.conf.", 4)
+        end
+
+        if res.status ~= 0 then
+            log_debug("subliminal exit=" .. tostring(res.status)
+                .. (res.stderr and res.stderr ~= "" and
+                    (" stderr=" .. res.stderr:gsub("%s+$", "")) or ""))
+        end
+
+        for _, ext in ipairs(sub_exts) do
+            local staged_sub = utils.join_path(job_tmp_dir,
+                search_stem .. "." .. target_lang[2] .. "." .. ext)
+            if file_exists(staged_sub) then
+                local file_hash = get_file_hash(staged_sub)
+                if file_hash and seen_sub_hashes[file_hash] then
+                    clean_dir(job_tmp_dir)
+                    return log_warn("No new subtitle found (duplicate file)", 2)
+                end
+                if file_hash then seen_sub_hashes[file_hash] = true end
+
+                download_count = download_count + 1
+
+                -- Where does the sub end up?
+                local target_dir
+                if opts.download_to_tmp or is_stream then
+                    target_dir = keep_tmp_dir
+                elseif writable_dir(media_dir) then
+                    target_dir = media_dir
+                else
+                    target_dir = mp.command_native({ "expand-path", opts.lyrics_store })
+                    ensure_dir(target_dir)
+                end
+
+                local final_sub = pick_free_target(target_dir, output_stem, target_lang[2], ext)
+                local ok, move_err = move_file(staged_sub, final_sub)
+                if not ok then
+                    clean_dir(job_tmp_dir)
+                    return log_warn("Failed to move subtitle: " .. tostring(move_err), 3)
+                end
+
+                -- VobSub companion (.idx + .sub)
+                local load_target = final_sub
+                if ext == "idx" or ext == "sub" then
+                    local companion_ext = (ext == "idx") and "sub" or "idx"
+                    local staged_companion = utils.join_path(job_tmp_dir,
+                        search_stem .. "." .. target_lang[2] .. "." .. companion_ext)
+                    if file_exists(staged_companion) then
+                        local final_companion = final_sub:gsub("%." .. ext .. "$", "." .. companion_ext)
+                        local ok_comp, comp_err = move_file(staged_companion, final_companion)
+                        if not ok_comp then
+                            os.remove(final_sub)
+                            clean_dir(job_tmp_dir)
+                            return log_warn("Failed to move VobSub companion: " .. tostring(comp_err), 3)
+                        end
+                        if ext == "sub" then load_target = final_companion end
+                    elseif ext == "sub" then
+                        load_target = final_sub
+                    end
+                end
+
+                local add_ok, add_err = pcall(function()
+                    mp.commandv("sub-add", load_target, "select",
+                        "Downloaded • " .. target_lang[1], target_lang[2])
+                end)
+                if not add_ok then
+                    log_warn("sub-add failed: " .. tostring(add_err), 3)
+                end
+
+                clean_dir(job_tmp_dir)
+                mp.osd_message("", 0)
+                return log_info(target_lang[1] .. " subtitle #" .. download_count .. " ready!", 2)
+            end
+        end
+
+        clean_dir(job_tmp_dir)
+        log_warn("No " .. target_lang[1] .. " subtitles found", 2)
+    end)
+end
+
+local function download_alt_subs(manual_query)
+    local lang = alt_languages[alt_lang_index]
+    download_subs(manual_query, lang)
+    alt_lang_index = (alt_lang_index % #alt_languages) + 1
+end
+
+------------------------------------------------------------------
+-- Smart dispatcher
+------------------------------------------------------------------
+local function smart_dispatch(is_manual, is_alt)
+    cancel_auto_download()
+
+    local function execute_search(query)
+        if has_video_track() then
+            if is_alt then download_alt_subs(query)
+            else download_subs(query, primary_lang) end
         else
+            download_lyrics(query)
+        end
+    end
+
+    if is_manual then
+        if not user_input_loaded or not user_input then
+            mp.osd_message("user-input-module not found. Can't prompt.", 2)
             return
         end
+        local current_path = mp.get_property("path") or ""
+        local current_filename = current_path:match("([^/\\]+)$") or current_path
+        user_input.get_user_input(function(line, err)
+            local query = nonempty(line)
+            if err or not query then return end
+            execute_search(query)
+        end, {
+            request_text  = "Enter title/query to search:",
+            default_input = current_filename,
+            cursor_pos    = #current_filename + 1,
+        })
+    else
+        execute_search(nil)
     end
-    log('No subtitles were found')
 end
 
 ------------------------------------------------------------------
--- KEYBINDINGS & AUTOMATIC EVENTS
+-- Auto-download on load
 ------------------------------------------------------------------
-
--- the new unified keybind
-mp.add_key_binding(options.smart_binding, "smart-subtitle-download", smart_subtitle_download)
-
--- original lyrics keybindings
-mp.add_key_binding(options.lyrics_musixmatch_binding, "musixmatch-download", function()
-    lyrics_manual_run = true
-    lyrics_auto_download()
-end)
-mp.add_key_binding(options.lyrics_lrclib_binding, "netease-download", function()
-    lyrics_manual_run = true
-    lyrics_lrclib_download()
-end)
-mp.add_key_binding(options.lyrics_offset_binding, "offset-sub", function()
-    local sub_path = mp.get_property("current-tracks/sub/external-filename")
-    if not sub_path then
-        lyrics_error("No external subtitle is loaded")
-        return
-    end
-    mp.set_property("sub-delay", mp.get_property_number("playback-time"))
-    mp.command("sub-reload")
-    mp.osd_message("Subtitles updated")
-end)
-
--- original Subliminal keybindings
-mp.add_key_binding(options.sub_download_binding, "download_subs", sub_download)
-mp.add_key_binding(options.sub_download2_binding, "download_subs2", sub_download2)
-mp.register_event('file-loaded', sub_control_downloads)
-
--- original YouTube keybindings
-mp.add_key_binding(options.yt_select_binding, "ytsub-select", function() yt_download(false) end)
-mp.add_key_binding(options.yt_autoload_binding, "ytsub-autoload", function() yt_download(true) end)
-if options.yt_autoload_on_start then
-    mp.register_event("file-loaded", function() yt_download(true, true) end)
+schedule_auto_download = function()
+    auto_dl_timer = mp.add_timeout(opts.auto_download_delay, function()
+        auto_dl_timer = nil
+        if not has_video_track() then return end
+        if not has_loaded_subtitle(primary_lang[2]) then
+            download_subs(nil, primary_lang)
+        end
+    end)
 end
 
--- original lyrics on-load cache check / auto-run
-lyrics_check_downloaded()
+------------------------------------------------------------------
+-- Preflight
+------------------------------------------------------------------
+local function preflight()
+    local path = get_subliminal_bin()
+    if path:match("^[/~]") then
+        local expanded = mp.command_native({ "expand-path", path })
+        if not file_exists(expanded) then
+            log_warn("Subliminal not found at: " .. tostring(expanded), 4)
+        end
+    else
+        local res = utils.subprocess({ args = { "which", path }, capture_stdout = true })
+        if res.status ~= 0 then
+            log_debug("Subliminal not found on PATH (will fail at runtime): " .. path)
+        end
+    end
+end
+preflight()
+
+------------------------------------------------------------------
+-- Keybindings
+------------------------------------------------------------------
+mp.add_key_binding(opts.sub_download_binding, "smart-dl-primary",
+    function() smart_dispatch(false, false) end)
+mp.add_key_binding(opts.sub_download_manual_binding, "smart-dl-primary-manual",
+    function() smart_dispatch(true, false) end)
+mp.add_key_binding(opts.sub_download_alt_binding, "smart-dl-alt",
+    function() smart_dispatch(false, true) end)
+mp.add_key_binding(opts.sub_download_alt_manual_binding, "smart-dl-alt-manual",
+    function() smart_dispatch(true, true) end)
