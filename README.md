@@ -51,7 +51,7 @@ brew install mpv yt-dlp ffmpeg deno alass subliminal dovi_tool hdr10plus_tool pi
 
 1. **Clone configuration**:
    ```bash
-   git clone https://github.com/PimpleGrimple/Mac-MPV.git ~/.config/mpv
+   git clone https://github.com/PimpleGrimple/Mac_MPV.git ~/.config/mpv
    chmod +x ~/.config/mpv/mpv-launcher.py
    ```
 
