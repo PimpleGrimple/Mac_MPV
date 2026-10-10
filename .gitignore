@@ -22,6 +22,12 @@ cache/
 *.log
 /tmp/
 
+# VapourSynth local environment directory (ignore contents, keep vsdetect tracked)
+VapourSynth/*
+!VapourSynth/bin/
+VapourSynth/bin/*
+!VapourSynth/bin/vsdetect
+
 # Archives and custom builds
 archive/
 custom-build-*/

@@ -769,3 +769,46 @@ chrome.webRequest.onHeadersReceived.addListener(
   { urls: ['<all_urls>'] },
   ['responseHeaders']
 );
+
+// ---------------------------------------------------------------------------
+// Right-click menu: "Open in mpv" (selected URL, link, or the page itself).
+// Plain URL goes to the native host; mpv's yt-dlp hook resolves the site.
+// ---------------------------------------------------------------------------
+const MPV_MENU_ID = 'mb-open-in-mpv';
+
+function createMpvMenu() {
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: MPV_MENU_ID,
+      title: 'Open in mpv',
+      contexts: ['selection', 'link', 'page', 'video', 'audio']
+    });
+  });
+}
+
+chrome.runtime.onInstalled.addListener(createMpvMenu);
+chrome.runtime.onStartup.addListener(createMpvMenu);
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId !== MPV_MENU_ID) return;
+
+  let url = info.linkUrl || '';
+  if (!url && info.selectionText) {
+    const m = info.selectionText.match(/https?:\/\/[^\s"'<>]+/i);
+    if (m) url = m[0];
+  }
+  if (!url && /^https?:\/\//i.test(info.srcUrl || '')) url = info.srcUrl;
+  if (!url) url = info.pageUrl || (tab && tab.url) || '';
+  if (!/^https?:\/\//i.test(url)) return;
+
+  const msg = buildNativeMpvMessage({
+    url,
+    ref: url === info.pageUrl ? '' : (info.pageUrl || ''),
+    title: (tab && tab.title) || 'video'
+  });
+  chrome.runtime.sendNativeMessage(MPV_NATIVE_HOST, msg, response => {
+    if (chrome.runtime.lastError) {
+      console.error('[Media Blocker] Open in mpv failed:', chrome.runtime.lastError.message);
+    }
+  });
+});

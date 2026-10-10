@@ -242,8 +242,9 @@
 
   function parseM3U8Variants(text, baseUrl) {
     const lines = text.split(/\r?\n/);
-    const byQuality = new Map();
-    const unknown = new Map();
+    const seen = new Set();
+    const known = [];
+    const unknown = [];
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
@@ -252,8 +253,14 @@
       const resMatch = /RESOLUTION=\d+x(\d+)/i.exec(line);
       const height = resMatch ? parseInt(resMatch[1], 10) : null;
       const quality = Number.isFinite(height) ? height + 'p' : null;
-      const bandwidthMatch = /(?:^|,)BANDWIDTH=(\d+)/i.exec(line);
+      const bandwidthMatch = /(?:^|[,:])BANDWIDTH=(\d+)/i.exec(line);
       const bandwidth = bandwidthMatch ? parseInt(bandwidthMatch[1], 10) : 0;
+      const avgMatch = /AVERAGE-BANDWIDTH=(\d+)/i.exec(line);
+      const avgBandwidth = avgMatch ? parseInt(avgMatch[1], 10) : 0;
+      const fpsMatch = /FRAME-RATE=([\d.]+)/i.exec(line);
+      const fps = fpsMatch ? parseFloat(fpsMatch[1]) : null;
+      const codecMatch = /CODECS="([^"]+)"/i.exec(line);
+      const codecs = codecMatch ? codecMatch[1] : '';
 
       let uri = null;
       for (let j = i + 1; j < lines.length; j++) {
@@ -266,27 +273,73 @@
 
       try {
         const absoluteUrl = new URL(uri, baseUrl).href;
-        const candidate = { url: absoluteUrl, quality, height, bandwidth };
-
-        // This site can advertise the same resolution multiple times (sometimes
-        // even with the exact same URL). The panel is a resolution chooser, so
-        // keep only one entry per resolution and prefer the highest-bandwidth
-        // variant when several distinct playlists share that resolution.
-        if (quality) {
-          const existing = byQuality.get(quality);
-          if (!existing || bandwidth > existing.bandwidth) {
-            byQuality.set(quality, candidate);
-          }
-        } else if (!unknown.has(absoluteUrl)) {
-          unknown.set(absoluteUrl, candidate);
-        }
+        // Only a *true* duplicate (same URL, resolution, bitrate and codecs)
+        // is dropped. Same resolution with a different bitrate is a different
+        // rendition and must stay selectable.
+        const key = [absoluteUrl, height, bandwidth, avgBandwidth, codecs].join('|');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const candidate = { url: absoluteUrl, quality, height, bandwidth, avgBandwidth, fps, codecs };
+        (quality ? known : unknown).push(candidate);
       } catch (e) {}
     }
 
-    const variants = Array.from(byQuality.values());
-    variants.sort((a, b) => (b.height || 0) - (a.height || 0));
-    variants.push(...unknown.values());
+    const rate = v => v.avgBandwidth || v.bandwidth || 0;
+    known.sort((a, b) => (b.height - a.height) || (rate(b) - rate(a)));
+    unknown.sort((a, b) => rate(b) - rate(a));
+    const variants = known.concat(unknown);
+    labelVariants(variants);
     return variants;
+  }
+
+  function formatBitrate(bps) {
+    if (!bps) return '';
+    if (bps >= 1e6) return (Math.round(bps / 1e4) / 100) + ' Mbps';
+    return Math.round(bps / 1000) + ' kbps';
+  }
+
+  function codecFamily(codecs) {
+    const c = String(codecs || '').toLowerCase();
+    if (/av01/.test(c)) return 'AV1';
+    if (/hvc1|hev1|dvh1|dvhe/.test(c)) return 'HEVC';
+    if (/vp09|vp9/.test(c)) return 'VP9';
+    if (/avc1|avc3/.test(c)) return 'H.264';
+    return '';
+  }
+
+  // Gives each variant a label like "1080p · 4.5 Mbps" (+ fps / codec when
+  // those are what tell renditions apart). Guaranteed unique per variant.
+  function labelVariants(variants) {
+    const families = new Set(variants.map(v => codecFamily(v.codecs)).filter(Boolean));
+    const showCodec = families.size > 1;
+    const used = new Map();
+    for (const v of variants) {
+      const parts = [v.quality || 'Unknown'];
+      const br = formatBitrate(v.avgBandwidth || v.bandwidth);
+      if (br) parts.push(br);
+      if (v.fps && v.fps > 30) parts.push(Math.round(v.fps) + 'fps');
+      if (showCodec && codecFamily(v.codecs)) parts.push(codecFamily(v.codecs));
+      let label = parts.join(' · ');
+      const n = (used.get(label) || 0) + 1;
+      used.set(label, n);
+      if (n > 1) label += ' #' + n;
+      v.label = label;
+    }
+  }
+
+  // yt-dlp format selector for one exact rendition: height + bitrate window,
+  // falling back to height-only if the bitrate window matches nothing.
+  function variantToFormatSelector(v) {
+    if (!v || !Number.isFinite(v.height)) return null;
+    const h = v.height;
+    const bw = v.avgBandwidth || v.bandwidth;
+    const heightOnly = `bv*[height=${h}]+ba/b[height=${h}]`;
+    if (!bw) return heightOnly;
+    const tbr = bw / 1000;
+    const lo = Math.floor(tbr - 1);
+    const hi = Math.ceil(tbr + 1);
+    const exact = `[height=${h}][tbr>=${lo}][tbr<=${hi}]`;
+    return `bv*${exact}+ba/b${exact}/${heightOnly}`;
   }
 
   function qualityToFormatSelector(quality) {
@@ -1442,6 +1495,10 @@
         animation:mb-slide-up 0.4s var(--mb-ease) backwards;
         transition:all 0.25s var(--mb-ease); }
       .mb-row:hover { border-color:var(--mb-glass-border-hover); background:rgba(255,255,255,0.04); transform:scale(0.99) translateY(-1px); box-shadow:0 4px 12px rgba(0,0,0,0.2); }
+      .mb-row select.mb-quality { flex:0 1 auto; min-width:0; max-width:112px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .mb-row .mb-url { min-width:0; }
+      .mb-row .mb-badge, .mb-row .mb-expiry-dot { flex-shrink:0; }
+      .mb-row > div { flex-shrink:0; }
       .mb-row .mb-badge { font-size:11px; font-weight:700; padding:4px 8px; border-radius:8px; display:flex; align-items:center; gap:4px; letter-spacing:0.3px; }
       .mb-row .mb-url { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
         font-family:'SF Mono', ui-monospace, Menlo, monospace; font-size:12px; color:#d4d4d8; }
@@ -1636,24 +1693,26 @@
     variantSelect.style.cssText = 'appearance:none; border:none; outline:none; cursor:pointer; padding-right:14px; background:rgba(255,255,255,.06) url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'10\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'%239d9da2\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'%3E%3Cpolyline points=\'6 9 12 15 18 9\'%3E%3C/polyline%3E%3C/svg%3E") no-repeat right 3px center;';
 
     const autoOpt = document.createElement('option');
-    autoOpt.value = state.url;
+    autoOpt.value = 'auto';
     autoOpt.textContent = 'Auto (Best)';
     autoOpt.style.background = '#1a1a1c';
     variantSelect.appendChild(autoOpt);
 
-    state.variants.forEach(v => {
+    state.variants.forEach((v, idx) => {
       const opt = document.createElement('option');
-      opt.value = v.url;
-      opt.textContent = v.quality || 'Unknown';
+      opt.value = String(idx);
+      opt.textContent = v.label || v.quality || 'Unknown';
+      opt.title = [v.quality, formatBitrate(v.bandwidth), v.fps ? v.fps + 'fps' : '', v.codecs].filter(Boolean).join(' · ');
       opt.style.background = '#1a1a1c';
       variantSelect.appendChild(opt);
     });
 
     variantSelect.onchange = () => {
-      const selected = state.variants.find(v => v.url === variantSelect.value) || null;
-      state.selectedUrl = variantSelect.value;
+      const selected = variantSelect.value === 'auto' ? null : (state.variants[parseInt(variantSelect.value, 10)] || null);
+      state.selectedVariant = selected;
+      state.selectedUrl = selected ? selected.url : state.url;
       state.selectedQuality = selected ? selected.quality : null;
-      state.downloadFormat = qualityToFormatSelector(state.selectedQuality);
+      state.downloadFormat = variantToFormatSelector(selected);
       onSelect(state.selectedUrl);
     };
     return variantSelect;
@@ -1719,11 +1778,19 @@
       // --referrer/--user-agent before loading in mpv (needed for CDNs that
       // check these). Falls back to a bare URL when we have neither header,
       // so the clipboard still works as a normal link anywhere else.
-      const playUrl = state.selectedUrl || state.url;
+      // With a chosen rendition we copy the *master* URL plus a yt-dlp format
+      // selector (same as the play/download buttons), because a child
+      // playlist is often video-only.
+      const fmt = state.downloadFormat || null;
+      const playUrl = fmt ? state.url : (state.selectedUrl || state.url);
       const payload = { url: playUrl };
       if (state.ref) payload.ref = state.ref;
       if (navigator.userAgent) payload.ua = navigator.userAgent;
-      const text = (payload.ref || payload.ua)
+      if (fmt) {
+        payload.format = fmt;
+        if (state.selectedVariant && state.selectedVariant.label) payload.label = state.selectedVariant.label;
+      }
+      const text = (payload.ref || payload.ua || payload.format)
         ? '#MBSTREAM\n' + JSON.stringify(payload)
         : playUrl;
       if (typeof GM_setClipboard === 'function') GM_setClipboard(text);
@@ -1885,7 +1952,7 @@
 
     list.appendChild(row);
 
-    const entryRef = { state, link, row, expiryDot, qualityBadge, badge };
+    const entryRef = { state, link, row, expiryDot, qualityBadge, badge, variantSelect };
     allEntryRefs.push(entryRef);
     updateExpiryVisual(entryRef);
     return entryRef;

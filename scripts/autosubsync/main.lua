@@ -6,6 +6,8 @@
 local mp = require('mp')
 local utils = require('mp.utils')
 local mpopt = require('mp.options')
+-- menu.lua lives in ~~/script-modules/ (or put it next to this file)
+package.path = mp.command_native({ "expand-path", "~~/script-modules" }) .. "/?.lua;" .. package.path
 local menu = require('menu')
 local sub = require('subtitle')
 local ref_selector
@@ -346,40 +348,23 @@ end
 ------------------------------------------------------------
 -- Menu actions & bindings
 
+-- The look comes from menu.lua: the shared style (menu-* script-opts) plus optional per-script overrides, e.g.
+--   script-opts-append=autosubsync-menu_accent_color=ff6b71
 ref_selector = menu:new {
-    items = { 'Sync with audio', 'Sync with other subtitles', 'Save current timeline', 'Exit' },
+    items = { 'Sync with audio', 'Sync with other subtitles', 'Save current timeline' },
     last_choice = 'audio',
     pos_x = 50,
     pos_y = 50,
     rect_width = 400,
-    text_color = 'fff5da',
-    border_color = '2f1728',
-    active_color = 'ff6b71',
-    inactive_color = 'fff5da',
+    keys = {
+        confirm = { 'ENTER', 'KP_ENTER', 'l' },
+        cancel = { 'ESC', 'h', 'n', 'MBTN_RIGHT' },
+    },
 }
 
-function ref_selector:get_keybindings()
-    return {
-        { key = 'h', fn = function() self:close() end },
-        { key = 'j', fn = function() self:down() end },
-        { key = 'k', fn = function() self:up() end },
-        { key = 'l', fn = function() self:act() end },
-        { key = 'down', fn = function() self:down() end },
-        { key = 'up', fn = function() self:up() end },
-        { key = 'Enter', fn = function() self:act() end },
-        { key = 'ESC', fn = function() self:close() end },
-        { key = 'n', fn = function() self:close() end },
-        { key = 'WHEEL_DOWN', fn = function() self:down() end },
-        { key = 'WHEEL_UP', fn = function() self:up() end },
-        { key = 'MBTN_LEFT', fn = function() self:act() end },
-        { key = 'MBTN_RIGHT', fn = function() self:close() end },
-    }
-end
-
-function ref_selector:new(o)
-    self.__index = self
-    o = o or {}
-    return setmetatable(o, self)
+-- Enter / l / click / number key: menu.lua closes the menu first, then calls this
+function ref_selector:on_select()
+    self:act()
 end
 
 function ref_selector:get_ref()
@@ -401,13 +386,8 @@ function ref_selector:get_subsync_tool()
 end
 
 function ref_selector:act()
-    self:close()
-
     if self.selected == 3 then
         return sync_to_manual_offset()
-    end
-    if self.selected == 4 then
-        return
     end
 
     engine_selector:init()
@@ -423,27 +403,11 @@ function ref_selector:call_subsync()
     end
 end
 
-function ref_selector:open()
-    self.selected = 1
-    for _, val in pairs(self:get_keybindings()) do
-        mp.add_forced_key_binding(val.key, val.key, val.fn)
-    end
-    self:draw()
-end
-
-function ref_selector:close()
-    for _, val in pairs(self:get_keybindings()) do
-        mp.remove_key_binding(val.key)
-    end
-    self:erase()
-end
-
-
 ------------------------------------------------------------
 -- Engine selector
 
 engine_selector = ref_selector:new {
-    items = { 'ffsubsync', 'alass', 'exit' },
+    items = { 'ffsubsync', 'alass' },
     last_choice = 'ffsubsync',
 }
 
@@ -460,14 +424,10 @@ function engine_selector:get_engine_name()
 end
 
 function engine_selector:act()
-    self:close()
-
     if self.selected == 1 then
         self.last_choice = 'ffsubsync'
     elseif self.selected == 2 then
         self.last_choice = 'alass'
-    elseif self.selected == 3 then
-        return
     end
 
     track_selector:init()
@@ -521,7 +481,6 @@ function track_selector:init()
         return
     end
 
-    table.insert(self.items, "exit")
     self:open()
 end
 
@@ -533,12 +492,6 @@ function track_selector:get_selected_track()
 end
 
 function track_selector:act()
-    self:close()
-
-    if self.selected == #self.items then
-        return
-    end
-
     ref_selector:call_subsync()
 end
 

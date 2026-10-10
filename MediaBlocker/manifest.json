@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Media Blocker",
-  "version": "3.59",
+  "version": "3.60",
   "description": "Intercepts and blocks stream URLs (m3u8, mp4, etc.) and shows a panel with a open-in-mpv or download button.",
   "permissions": [
     "webRequest",
@@ -9,7 +9,8 @@
     "declarativeNetRequestWithHostAccess",
     "storage",
     "tabs",
-    "nativeMessaging"
+    "nativeMessaging",
+    "contextMenus"
   ],
   "host_permissions": [
     "<all_urls>"

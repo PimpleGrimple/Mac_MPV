@@ -149,7 +149,7 @@ local user_opts = {
     window_controls_title = " " , --"${media-title}", -- same as title but for window_controls
 
     -- Subtitle display settings
-    raise_subtitles = true,      -- whether to raise subtitles above the osc when it's shown
+    raise_subtitles = false,      -- whether to raise subtitles above the osc when it's shown
     raise_subtitle_amount = 160, -- how much subtitles rise when the osc is shown
 
     -- Buttons display and functionality

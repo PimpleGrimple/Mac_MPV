@@ -6,9 +6,13 @@ local options = {
     paste_keybind = [[ ["meta+v"] ]],
     copy_timestamp_keybind = [[ ["meta+alt+c", "meta+shift+t"] ]],
     copy_timestamped_url = true,
+    -- YouTube links: also copy the chosen ytdl-format (as #MBSTREAM, mpv-only).
+    -- Set to no for a plain browser-friendly timestamped URL.
+    copy_youtube_format = true,
 }
 
 (require "mp.options").read_options(options)
+options.copy_youtube_format = (options.copy_youtube_format == true or options.copy_youtube_format == "yes" or options.copy_youtube_format == "true")
 options.copy_keybind = utils.parse_json(options.copy_keybind)
 options.paste_keybind = utils.parse_json(options.paste_keybind)
 options.copy_timestamp_keybind = utils.parse_json(options.copy_timestamp_keybind)
@@ -121,19 +125,27 @@ local function parse_mbstream(raw)
     return nil
 end
 
-local function add_item(type, val, start_time)
-    local opt = start_time and ("start=" .. start_time) or nil
+local function add_item(type, val, start_time, ytdl_format)
+    local opts = {}
+    if start_time then opts[#opts + 1] = "start=" .. start_time end
+    if ytdl_format and ytdl_format ~= "" then
+        -- %len%value syntax so [ ] / + > = in the selector survive option parsing
+        opts[#opts + 1] = string.format("ytdl-format=%%%d%%%s", #ytdl_format, ytdl_format)
+        -- ytdl:// forces the ytdl hook even for .m3u8 (which it excludes by default)
+        if not val:match("^ytdl://") then val = "ytdl://" .. val end
+    end
+    local opt = #opts > 0 and table.concat(opts, ",") or nil
     if mp.get_property_number("playlist-count", 0) == 0 then
         mp.osd_message(string.format("Opening %s%s...", type, start_time and (" at " .. format_timestamp(start_time)) or ""))
         if opt then
-            mp.commandv("loadfile", val, "replace", opt)
+            mp.commandv("loadfile", val, "replace", "-1", opt)
         else
             mp.commandv("loadfile", val, "replace")
         end
     else
         mp.osd_message(string.format("Added %s to playlist%s", type, start_time and (" (starts at " .. format_timestamp(start_time) .. ")") or ""))
         if opt then
-            mp.commandv("loadfile", val, "append-play", opt)
+            mp.commandv("loadfile", val, "append-play", "-1", opt)
         else
             mp.commandv("loadfile", val, "append-play")
         end
@@ -153,7 +165,7 @@ local function paste()
         if mb.ref and mb.ref ~= "" then mp.set_property("referrer", mb.ref) end
         if mb.ua and mb.ua ~= "" then mp.set_property("user-agent", mb.ua) end
         local url_time = extract_url_timestamp(mb.url)
-        add_item("URL", mb.url, url_time)
+        add_item("URL", mb.url, url_time, mb.format)
         return
     end
 
@@ -175,7 +187,7 @@ local function paste()
     elseif file_exists(clean_path) then
         add_item("file", clean_path)
     else
-        mp.osd_message("Invalid clipboard content: " .. clip, 3)
+        mp.osd_message("Invalid clipboard content: " .. (#clip > 80 and (clip:sub(1, 80) .. "...") or clip), 3)
     end
 end
 
@@ -194,19 +206,43 @@ local function copy()
     end
     path = path:match("^%s*(.-)%s*$")
 
+    -- Files opened with a format selector are loaded as ytdl://URL; copy the
+    -- plain URL and carry the selector along so pasting reproduces the choice.
+    local via_ytdl = false
+    if path:match("^ytdl://") then
+        path = (path:gsub("^ytdl://", ""))
+        via_ytdl = true
+    end
+
     local is_yt = path:match("youtube%.com") or path:match("youtu%.be")
     local is_u = is_url(path)
 
-    if is_u and not is_yt then
-        local ua = mp.get_property("user-agent", "Mozilla/5.0")
-        local ref = mp.get_property("referrer", "")
-        
-        local payload = { url = path, ua = ua, ref = ref }
+    local yt_fmt = nil
+    if is_yt and is_u and options.copy_youtube_format then
+        local f = mp.get_property("ytdl-format")
+        if f and f ~= "" then yt_fmt = f end
+    end
+
+    if is_u and (not is_yt or yt_fmt) then
+        local payload
+        if is_yt then
+            -- keep the timestamp behaviour of plain YouTube copies
+            local u = path:gsub("([&?])t=[%d%.]+", function(c) return c == "?" and "?" or "" end):gsub("[?&]$", "")
+            local t = mp.get_property_number("time-pos", 0)
+            if t > 0 then u = u .. (u:find("?") and "&" or "?") .. "t=" .. math.floor(t) end
+            payload = { url = u }
+        else
+            payload = { url = path, ua = mp.get_property("user-agent", "Mozilla/5.0"), ref = mp.get_property("referrer", "") }
+        end
+        -- Include the active ytdl-format whenever one is set (covers files opened
+        -- via the extension's play button too, not only ytdl:// paste).
+        local f = mp.get_property("ytdl-format")
+        if f and f ~= "" then payload.format = f end
         local json_str, err = utils.format_json(payload)
         
         if json_str then
             path = "#MBSTREAM\n" .. json_str
-            mp.osd_message("Copied Stream for mpv")
+            mp.osd_message("Copied URL")
         else
             mp.osd_message("Failed to format stream")
             return
@@ -215,7 +251,7 @@ local function copy()
         path = path:gsub("([&?])t=[%d%.]+", function(s) return s == "?" and "?" or "" end):gsub("[?&]$", "")
         local t = mp.get_property_number("time-pos", 0)
         if t > 0 then path = path .. (path:find("?") and "&" or "?") .. "t=" .. math.floor(t) end
-        mp.osd_message("Copied Timestamped URL")
+        mp.osd_message("Copied URL")
     else
         mp.osd_message("Copied path")
     end
