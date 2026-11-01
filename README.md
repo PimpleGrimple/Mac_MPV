@@ -221,7 +221,7 @@ EOF
 * **selectformat.lua**: In-player quality and stream selector for YouTube and multi-track media (`y`).
 * **playlist_manager.lua**: Interactive playlist navigation and file management via `mp.input` (`meta+p`: Menu | `meta+f`: Favorite | `meta+W`: Watch later | `ctrl+e`: Export playlist).
 * **screenshot_folder.lua**: Saves titled screenshots to media-specific folders and copies directly to clipboard (`j`: Video frame grab | `Alt+j`: Screenshot with subtitles | `J`: Window screenshot).
-* **copypaste.lua**: Clipboard stream URL pasting and path copying (`meta+c`: Copy path | `meta+v`: Paste and play | `meta+C`: Copy subtitle | `meta+alt+c`: Copy timestamp | `Alt+o`: Reveal in Finder / open URL).
+* **copypaste.lua**: Clipboard stream URL pasting and path copying (`meta+c`: Copy path/URL or active subtitle | `meta+v`: Paste and play | `meta+alt+c`: Copy timestamp).
 * **pip.lua**: Toggles borderless, aspect-locked floating window (`Alt+p` / `π`).
 * **auto_save.lua**: Persists playback position, selected audio track, and subtitle track across sessions.
 * **cookie_cache.lua**: Extracts and caches browser cookies for yt-dlp playback.

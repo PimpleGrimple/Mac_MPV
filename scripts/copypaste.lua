@@ -212,21 +212,10 @@ local function copy_timestamp()
     mp.osd_message("Copied timestamp: " .. ts, 2)
 end
 
-local function open_current()
-    local path = get_current_target()
-    if not path then return end
-    local is_u = is_url(path)
-    local target = is_u and path or normalize_path(path)
-    local args = is_u and { "/usr/bin/open", target } or { "/usr/bin/open", "-a", "Finder", "-R", target }
-    mp.command_native_async({ name = "subprocess", playback_only = false, args = args })
-end
-
 local bindings = {
     { keys = { "meta+c" }, name = "copy", fn = copy },
     { keys = { "meta+v" }, name = "paste", fn = paste },
     { keys = { "meta+alt+c" }, name = "copy_timestamp", fn = copy_timestamp },
-    { keys = { "meta+C" }, name = "copy_sub", fn = function() copy_sub(false) end },
-    { keys = { "Alt+o" }, name = "open_current", fn = open_current },
 }
 
 for _, b in ipairs(bindings) do
