@@ -31,3 +31,8 @@ VapourSynth/bin/*
 # Archives and custom builds
 archive/
 custom-build-*/
+
+# Local macOS aliases and symlinks
+/screenshot
+/ytdlp config
+/MPV
