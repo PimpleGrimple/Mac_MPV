@@ -2374,7 +2374,7 @@ local function make_sponsorblock_segments()
                     end
                 end
                 if string.find(chapter.title, ("start"):gsub("[%[%]]", "%%%1")) then
-                    if not is_start_added then
+                    if not is_start_added and temp_segment[current_category] then
                         temp_segment[current_category]["start"] = chapter.time / duration * 100
                         temp_segment[current_category]["is_start_added"] = true
                     end
@@ -5056,7 +5056,7 @@ if user_opts.key_bindings then
         mp.commandv("script-binding", "select/select-chapter")
     end)
 
-    mp.add_key_binding("p", "pinwindow", function()
+    mp.add_key_binding("P", "pinwindow", function()
         mp.commandv("cycle", "ontop")
         if state.initialborder == 'yes' then
             if mp.get_property('ontop') == 'yes' then

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Media Blocker settings: stream blocking, captured streams on this page, and mpv playback options.">
+  <title>Media Blocker</title>
+  <link rel="icon" type="image/png" href="icon128.png">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Status Toast -->
+  <div id="toast" class="toast" aria-live="polite">
+    <svg id="toastSuccessIcon" class="toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+      <polyline points="20 6 9 17 4 12"></polyline>
+    </svg>
+    <svg id="toastErrorIcon" class="toast-icon error-icon hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+      <circle cx="12" cy="12" r="10"></circle>
+      <line x1="15" y1="9" x2="9" y2="15"></line>
+      <line x1="9" y1="9" x2="15" y2="15"></line>
+    </svg>
+    <span id="toastText">Settings saved</span>
+  </div>
+
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo-area">
+        <svg class="logo-icon" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+          <rect x="5" y="8" width="26" height="17" rx="3" fill="none" stroke="currentColor" stroke-width="2.2"/>
+          <polygon points="14,12 14,21 23,16.5" fill="currentColor"/>
+          <line x1="18" y1="25" x2="18" y2="28" stroke="currentColor" stroke-width="2.2"/>
+          <line x1="12" y1="28" x2="24" y2="28" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+        </svg>
+        <h1 class="title">Media Blocker</h1>
+      </div>
+      <div class="header-right">
+        <div id="modeSwitch" class="mode-switch hidden" role="group" aria-label="Mode for this site">
+          <button type="button" class="mode-opt" data-mode="block" aria-label="Blocking" title="Blocking: hides media on this site and lists it here"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg><span>Blocking</span></button>
+          <button type="button" class="mode-opt" data-mode="capture" aria-label="Capture only" title="Capture only: lists media here without blocking playback"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><span>Capture</span></button>
+          <button type="button" class="mode-opt" data-mode="off" aria-label="Off" title="Off on this site. Click to turn it on" hidden><i class="off-dot"></i><span>Off</span></button>
+        </div>
+        <span class="version-badge" id="versionBadge"></span>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" role="tab" data-tab="streams" aria-selected="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="9" y1="6" x2="21" y2="6"/><line x1="9" y1="12" x2="21" y2="12"/><line x1="9" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1.2"/><circle cx="4" cy="12" r="1.2"/><circle cx="4" cy="18" r="1.2"/></svg><span>Streams</span><span class="tab-n" id="streamsTabCount"></span></button>
+      <button class="tab" role="tab" data-tab="mpv" aria-selected="false"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><polygon points="10 7.5 15.5 10 10 12.5" fill="currentColor"/><line x1="8" y1="21" x2="16" y2="21"/></svg><span>mpv</span></button>
+      <button class="tab" role="tab" data-tab="blocking" aria-selected="false"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span>Blocking</span></button>
+    </nav>
+
+    <!-- Warning Banner for Missing System Requirements -->
+      <div id="ytdlWarningBanner" class="warning-banner hidden">
+        <div style="display: flex; gap: 8px; align-items: flex-start;">
+          <span style="font-size: 14px; line-height: 1;">⚠️</span>
+          <span id="warningBannerText"><strong>System Warning:</strong> System requirements are missing.</span>
+        </div>
+      </div>
+
+
+    <main class="content">
+      <div class="tab-panel" data-panel="streams" role="tabpanel">
+      <!-- Section: Play Current Tab -->
+      <section class="section play-section">
+        <div class="play-row">
+          <input type="text" id="videoUrl" class="form-input" placeholder="Enter video URL...">
+          <button id="playCurrentTabBtn" class="play-btn" disabled aria-label="Play in MPV">
+            <span class="play-btn-content">
+              <svg class="play-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+              </svg>
+              <span id="playBtnText" class="hidden">Play in MPV</span>
+            </span>
+            <span class="spinner-container hidden">
+              <span class="spinner"></span>
+            </span>
+          </button>
+        </div>
+        <div id="playWarning" class="play-warning hidden">
+          <svg class="warning-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+            <line x1="12" y1="9" x2="12" y2="13"></line>
+            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+          </svg>
+          <span id="warningText"></span>
+        </div>
+      </section>
+
+        <!-- Shown instead of the list when there is nothing to list -->
+        <div id="streamNotice" class="stream-notice hidden">
+          <div class="notice-row"><span class="notice-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span><p id="streamNoticeText"></p></div>
+          <button id="streamNoticeBtn" class="notice-btn hidden" type="button"></button>
+        </div>
+
+        <!-- Captured on this page -->
+        <section class="section streams-section" id="streamsSection">
+          <div class="filter-chips" id="filterChips">
+            <button class="chip active" data-filter="all" type="button">All <span class="chip-n">0</span></button>
+            <button class="chip" data-filter="video" type="button">Video <span class="chip-n">0</span></button>
+            <button class="chip" data-filter="image" type="button">Image <span class="chip-n">0</span></button>
+            <button class="chip" data-filter="audio" type="button">Audio <span class="chip-n">0</span></button>
+            <button class="chip" data-filter="subtitle" type="button">Subs <span class="chip-n">0</span></button>
+            <button class="chip" data-filter="font" type="button">Font <span class="chip-n">0</span></button>
+          </div>
+          <div class="bulk-bar">
+            <span class="bulk-summary" id="bulkSummary"></span>
+            <div class="bulk-actions">
+              <button id="bulkDownload" class="icon-btn" type="button" title="Download all shown" aria-label="Download all shown"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span class="n" id="bulkDownloadN"></span></button>
+              <button id="bulkCopy" class="icon-btn" type="button" title="Copy all URLs" aria-label="Copy all URLs"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg></button>
+              <button id="bulkClear" class="icon-btn danger" type="button" title="Clear the list" aria-label="Clear the list"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
+            </div>
+          </div>
+          <div id="streamList" class="stream-list"></div>
+          <div id="streamEmpty" class="stream-empty hidden"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg><p id="streamEmptyText">Nothing blocked yet on this page.</p></div>
+        </section>
+      </div><!-- /streams panel -->
+
+      <div class="tab-panel" data-panel="mpv" role="tabpanel" hidden>
+      <!-- Section: Quality -->
+      <section class="section">
+        <h2 class="section-title">Quality</h2>
+
+        <div class="form-group">
+          <label for="qualityCap" class="form-label">Stream Quality</label>
+          <p class="form-desc">Highest quality when playing in mpv.</p>
+          <div class="select-wrapper">
+            <select id="qualityCap">
+              <option value="best">Best (Default)</option>
+              <option value="2160p">4K (2160p)</option>
+              <option value="1440p">2K (1440p)</option>
+              <option value="1080p">1080p Full HD</option>
+              <option value="720p">720p HD</option>
+              <option value="480p">480p SD</option>
+              <option value="360p">360p</option>
+              <option value="240p">240p</option>
+              <option value="audio">Audio Only</option>
+            </select>
+            <div class="select-arrow"></div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="downloadQuality" class="form-label">Download Quality</label>
+          <p class="form-desc">Highest quality when downloading with yt-dlp.</p>
+          <div class="select-wrapper">
+            <select id="downloadQuality">
+              <option value="best">Best (Default)</option>
+              <option value="2160p">4K (2160p)</option>
+              <option value="1440p">2K (1440p)</option>
+              <option value="1080p">1080p Full HD</option>
+              <option value="720p">720p HD</option>
+              <option value="480p">480p SD</option>
+              <option value="360p">360p</option>
+              <option value="240p">240p</option>
+              <option value="audio">Audio Only</option>
+            </select>
+            <div class="select-arrow"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section: Player Behavior -->
+      <section class="section">
+        <h2 class="section-title">Player Settings</h2>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="savePosition" class="setting-label">Resume Playback</label>
+            <p class="setting-desc">Reopen videos at the exact time you stopped watching.</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="savePosition">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="startFromCurrentTime" class="setting-label">Start at Current Time</label>
+            <p class="setting-desc">Open the page's video in MPV from where it is now (when playing the page itself).</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="startFromCurrentTime">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="autoPause" class="setting-label">Auto-Pause</label>
+            <p class="setting-desc">Pause the page's video when launching in MPV from the page.</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="autoPause">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="forceWindow" class="setting-label">Force Immediate Open</label>
+            <p class="setting-desc">Open the MPV window instantly, before the video loading finishes.</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="forceWindow">
+            <span class="slider"></span>
+          </label>
+        </div>
+      </section>
+
+      <!-- Section: Advanced -->
+      <section class="section">
+        <h2 class="section-title">Advanced</h2>
+
+        <div class="form-group">
+          <label for="customFlags" class="form-label">Custom Command-line Flags</label>
+          <p class="form-desc">Additional arguments passed to MPV (one per line or space-separated).</p>
+          <textarea id="customFlags" class="form-textarea" rows="2" placeholder="e.g. --volume=70&#10;--no-keepaspect-window"></textarea>
+        </div>
+      </section>
+
+      </div><!-- /mpv panel -->
+
+      <div class="tab-panel" data-panel="blocking" role="tabpanel" hidden>
+
+        <!-- Mode -->
+        <section class="section">
+          <h2 class="section-title">Mode</h2>
+          <div class="form-group">
+            <label for="globalMode" class="form-label">Default mode for all sites</label>
+            <p class="form-desc">Block hides media and lists it under Streams. Capture lists it without blocking playback. Off turns the extension off. To override a single site, use the Blocking / Capture switch at the top.</p>
+            <div class="select-wrapper">
+              <select id="globalMode">
+                <option value="block">Block (default)</option>
+                <option value="capture">Capture</option>
+                <option value="off">Off</option>
+              </select>
+              <span class="select-arrow"></span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Types -->
+        <section class="section">
+          <h2 class="section-title">Block Types</h2>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <label for="blockImage" class="setting-label">Images</label>
+              <p class="setting-desc">Prevent all image loading.</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="blockImage" data-type="image"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <label for="blockVideo" class="setting-label">Video</label>
+              <p class="setting-desc">Block autoplay and streaming video.</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="blockVideo" data-type="video"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <label for="blockAudio" class="setting-label">Audio</label>
+              <p class="setting-desc">Mute background audio.</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="blockAudio" data-type="audio"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <label for="blockFont" class="setting-label">Web Fonts</label>
+              <p class="setting-desc">Prevent @font-face loading.</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="blockFont" data-type="font"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <label for="blockSubtitle" class="setting-label">Subtitles</label>
+              <p class="setting-desc">vtt, srt, ass, etc.</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="blockSubtitle" data-type="subtitle"><span class="slider"></span></label>
+          </div>
+        </section>
+
+        <!-- Per-site -->
+        <section class="section">
+          <h2 class="section-title">This Site</h2>
+          <p class="form-desc" id="siteOnlyNote"></p>
+
+          <div class="form-group">
+            <label for="iconThreshold" class="form-label">Image icon threshold (px)</label>
+            <p class="form-desc">Images up to this width and height are allowed through when blocking images.</p>
+            <input type="number" id="iconThreshold" class="form-input" min="0" value="48">
+          </div>
+          <div class="form-group">
+            <label for="audioMarkers" class="form-label">Force URLs matching to Audio</label>
+            <p class="form-desc">One pattern per line.</p>
+            <textarea id="audioMarkers" class="form-textarea" rows="2"></textarea>
+          </div>
+        </section>
+
+        <!-- Lists -->
+        <section class="section">
+          <h2 class="section-title">Site &amp; URL Lists</h2>
+
+          <div class="form-group">
+            <label for="disabledSites" class="form-label">Disabled sites</label>
+            <p class="form-desc">One per line, e.g. youtube.com. Media Blocker does nothing on these sites. The mpv button and shortcut still work there.</p>
+            <textarea id="disabledSites" class="form-textarea" rows="3"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="blockKeywords" class="form-label">Always block URLs containing</label>
+            <p class="form-desc">One per line. Matching requests are blocked <em>and</em> kept out of the Streams list. For things you never want to see or play, like video segments (.ts, .m4s).</p>
+            <textarea id="blockKeywords" class="form-textarea" rows="4"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="exceptions" class="form-label">Never block URLs containing</label>
+            <p class="form-desc">One per line, * wildcard allowed. Matching requests are let through and never blocked. This doesn't hide anything from the list.</p>
+            <textarea id="exceptions" class="form-textarea" rows="3"></textarea>
+          </div>
+        </section>
+
+      </div><!-- /blocking panel -->
+    </main>
+  </div>
+
+  <script src="mpv-bridge.js"></script>
+  <script src="popup.js"></script>
+  <script src="streams.js"></script>
+</body>
+</html>

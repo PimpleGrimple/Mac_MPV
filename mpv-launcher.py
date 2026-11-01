@@ -39,8 +39,8 @@ YTDLP_STREAM_ARGS = (
 YTDLP_PIPE_ARGS = (
     "-q",
     "--no-warnings",
-    "--hls-use-mpegts"
-    "--impersonate chrome",
+    "--hls-use-mpegts",
+    "--impersonate", "chrome",
 )
 
 MPV_PIPE_ARGS = (
@@ -480,10 +480,70 @@ def clean_title(value):
     # Strip trailing site markers.
     value = re.sub(r"\s*(?:Online\s*-\s*)?Animepahe\s*$", "", value, flags=re.I)
     value = re.sub(r"\s*::\s*Animepahe\s*$", "", value, flags=re.I)
+    value = re.sub(r"\s*(?:[-|:]\s*)?Shared by ShowBox\s*$", "", value, flags=re.I)
     # Strip leftover container/stream hints that sometimes land in titles.
     value = re.sub(r"\s*[\[\(](?:manifest|m3u8|mpd|dash|hls|mp4|mkv|webm)[\]\)]\s*$",
                    "", value, flags=re.I)
     return value or "video"
+
+
+# Written into each download's lock dir and run by Terminal. Keeping the logic
+# in a file (instead of a nested-quoted `bash -lc '...'` string) means the title
+# and yt-dlp args never pass through shell quoting.
+DOWNLOAD_RUNNER = r'''#!/bin/bash
+LOCK="$(cd "$(dirname "$0")" && pwd)"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+TITLE="$(cat "$LOCK/title" 2>/dev/null)"
+TITLE="${TITLE:-video}"
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
+trap 'exit 130' INT TERM HUP
+
+# bash 3.2-safe NUL-separated read (macOS /bin/bash has no mapfile)
+ARGV=()
+while IFS= read -r -d '' a; do ARGV+=("$a"); done < "$LOCK/yt-dlp.args"
+if [ "${#ARGV[@]}" -eq 0 ]; then
+  echo "No yt-dlp arguments were provided."; read -r _; exit 2
+fi
+
+printf '\033]0;Downloading: %s\007' "$TITLE"
+printf '\033[1mDownloading\033[0m  %s\n\n' "$TITLE"
+
+"${ARGV[@]}"
+rc=$?
+
+case $rc in
+  0)   printf '\n\033[32mDone.\033[0m This window will close in a moment.\n'; sleep 3; exit 0 ;;
+  130) printf '\nCancelled.\n'; sleep 1; exit 130 ;;
+  *)   printf '\n\033[31mDownload failed\033[0m (yt-dlp exit %d). Press Return to close.\n' "$rc"
+       read -r _; exit "$rc" ;;
+esac
+'''
+
+
+def _lock_is_stale(lock):
+    """A lock is stale if its runner is dead (or never started and it is old)."""
+    try:
+        with open(os.path.join(lock, "pid")) as f:
+            os.kill(int(f.read().strip()), 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except (FileNotFoundError, ValueError):
+        try:
+            return time.time() - os.path.getmtime(lock) > 120
+        except OSError:
+            return True
+    except PermissionError:
+        return False
+
+
+def _safe_filename(title, max_bytes=180):
+    """Filesystem-safe stem: no leading/trailing dots, <= max_bytes UTF-8."""
+    title = title.strip().strip(".").strip() or "video"
+    while len(title.encode("utf-8")) > max_bytes:
+        title = title[:-1]
+    return title.strip().strip(".").strip() or "video"
 
 
 def download(url, title, base, format_selector=None):
@@ -495,61 +555,56 @@ def download(url, title, base, format_selector=None):
     )
     try:
         os.mkdir(lock)
-        os.chmod(lock, 0o700)
     except FileExistsError:
-        notify("mpv-launcher", f"Already downloading: {title}")
-        raise RuntimeError("download already in progress")
+        if not _lock_is_stale(lock):
+            notify("mpv-launcher", f"Already downloading: {title}")
+            raise RuntimeError("download already in progress")
+        log(f"[download] removing stale lock {lock}")
+        shutil.rmtree(lock, ignore_errors=True)
+        os.mkdir(lock)
+    os.chmod(lock, 0o700)
 
     # Title alone is the final name. yt-dlp's generic extractor sets %(id)s to
     # the manifest filename stem ("manifest" for a .mpd URL), which produced
     # ugly "Title [manifest].mkv" names. Dropping it means duplicates get
     # overwritten; if that ever matters, use %(autonumber)s instead.
-    output = os.path.expanduser(f"~/Downloads/{title}.%(ext)s")
+    # "%" must be doubled or yt-dlp treats it as an output-template field
+    # (a title like "100% Wolf" would otherwise fail).
+    stem = _safe_filename(title).replace("%", "%%")
+    output = os.path.expanduser(f"~/Downloads/{stem}.%(ext)s")
 
-    # Args go in the file WITHOUT the binary; the binary is passed to xargs.
     ytdlp_bin = base[0]
-    command = list(base[1:]) + list(YTDLP_DOWNLOAD_ARGS)
+    command = [ytdlp_bin] + list(base[1:]) + list(YTDLP_DOWNLOAD_ARGS)
     if format_selector:
         command += ["-f", str(format_selector)]
     command += ["-o", output, url]
 
-    args_file = os.path.join(lock, "yt-dlp.args")
     try:
-        with open(args_file, "wb") as f:
+        with open(os.path.join(lock, "yt-dlp.args"), "wb") as f:
             f.write(b"\0".join(str(arg).encode("utf-8") for arg in command))
             f.write(b"\0")
+        with open(os.path.join(lock, "title"), "w", encoding="utf-8") as f:
+            f.write(title)
+        runner = os.path.join(lock, "run.sh")
+        with open(runner, "w", encoding="utf-8") as f:
+            f.write(DOWNLOAD_RUNNER)
+        os.chmod(runner, 0o700)
 
-        lock_q = shlex.quote(lock)
-        args_q = shlex.quote(args_file)
-        title_q = shlex.quote(title)
-        ytdlp_q = shlex.quote(ytdlp_bin)
-        shell = (
-            f"trap 'rm -rf {lock_q}' EXIT; "
-            f"printf '%s\\n' 'Downloading:' {title_q}; "
-            f"if ! /usr/bin/xargs -0 {ytdlp_q} < {args_q}; then "
-            "  echo '[Failed] Download failed.'; "
-            "  sleep 5; "
-            "  exit 1; "
-            "fi; "
-            "echo '[Done] You can safely close this window.'; "
-            "sleep 5"
-        )
+        log(f"[download] runner={runner!r} argv_count={len(command)}")
 
-        terminal_command = "/bin/bash -lc " + shlex.quote(shell)
-        log(
-            f"[download] Terminal command length={len(terminal_command)} "
-            f"argv_count={len(command)} args_file={args_file!r}"
-        )
-
-        applescript_command = terminal_command.replace("\\", "\\\\").replace('"', '\\"')
-        applescript = (
-            'tell application "Terminal"\n'
-            '    activate\n'
-            f'    do script "{applescript_command}"\n'
-            'end tell'
-        )
+        # The command goes in as an AppleScript argument, so no escaping of
+        # quotes/backslashes is needed.
         subprocess.run(
-            ["osascript", "-e", applescript],
+            [
+                "osascript",
+                "-e", "on run argv",
+                "-e", 'tell application "Terminal"',
+                "-e", "activate",
+                "-e", "do script (item 1 of argv)",
+                "-e", "end tell",
+                "-e", "end run",
+                "exec /bin/bash " + shlex.quote(runner),
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,

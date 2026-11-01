@@ -1,9 +1,3 @@
--- Picture-in-Picture for mpv (macOS)
---
--- alt+p (input.conf: `script-message toggle-pip`) moves the window into the
--- bottom-right corner, on top, without borders; toggling again restores the
--- window state that was active before.
---
 -- macOS details this relies on:
 --   * The fullscreen enter/exit animation glides towards the "unfullscreened"
 --     window frame mpv stored when fullscreen was entered
@@ -16,8 +10,9 @@
 --     geometry change applies the size only (since mpv commit 7466a9f9) and the
 --     VO calls updateSize() instead of updateFrame().
 --   * `macos-fs-animation-duration=0` (mpv.conf) keeps initial placement instant.
---     The script uses "default" for its PiP transition, then restores the value
---     that was configured before the script changed it.
+--     The script restores whatever value was configured before it changed it,
+--     and by default (fs_animation=pip) never overrides it outside of PiP
+--     transitions, so ordinary fullscreen toggles keep your configured value.
 local mp = require("mp")
 local options = require("mp.options")
 local configured_fs_animation_duration = mp.get_property_native("macos-fs-animation-duration")
@@ -31,20 +26,36 @@ local NORMAL_GEOM = (configured_geometry and configured_geometry ~= "")
 
 -- Script-specific options remain in ~/.config/mpv/script-opts/pip.conf.
 local opts = {
-    hide_ui = true, -- hide ModernX's UI while in PiP
+    hide_ui = true,       -- hide ModernX's UI while in PiP
+    fs_animation = "gen", -- "pip": only touch macos-fs-animation-duration while
+                          --        a PiP transition involves fullscreen, then
+                          --        restore whatever you configured in mpv.conf.
+                          --        Normal fullscreen toggles keep your value
+                          --        (e.g. 0 = instant) for the whole session.
+                          -- "gen": after startup, set it to "default" and leave
+                          --        it there, so only the initial window
+                          --        placement stays instant and every later
+                          --        fullscreen transition animates.
 }
 options.read_options(opts, "pip")
 
+if opts.fs_animation ~= "gen" and opts.fs_animation ~= "pip" then
+    mp.msg.warn("Invalid fs_animation value '" .. tostring(opts.fs_animation) .. "'; using 'gen'")
+    opts.fs_animation = "gen"
+end
+
 local PIP_GEOM = "30%-25-25"   -- 30% of the screen wide, 25px from right/bottom
 local HIDE_UI = opts.hide_ui
+local FS_ANIMATION_GEN = opts.fs_animation == "gen"
 
 -- State
-local is_pip                       = false  -- PiP is active
-local entering_pip_from_fullscreen = false  -- PiP entered from fs, waiting for fs=false
-local pip_cancelled_by_fullscreen  = false  -- fs session that was entered from PiP
-local ui_hidden                    = false
-local fs_animation_armed           = false
-local saved_title                  = nil
+local is_pip                         = false  -- PiP is active
+local entering_pip_from_fullscreen   = false  -- PiP entered from fs, waiting for fs=false
+local pip_cancelled_by_fullscreen    = false  -- fs session that was entered from PiP
+local ui_hidden                      = false
+local fs_animation_armed             = false
+local fullscreen_retarget_generation = 0
+local saved_title                    = nil
 
 -- Windowed state, tracked while not in PiP or fullscreen
 local normal = {
@@ -70,6 +81,12 @@ local saved = {
 }
 
 -- ===== Helpers ===========================================================
+
+-- Keep geometry and its fallback marker in sync whenever either state table changes.
+local function set_geometry_state(state, geometry, is_fallback)
+    state.geometry = geometry or ""
+    state.geometry_is_fallback = is_fallback == true
+end
 
 local function set_ui_hidden(hidden)
     if HIDE_UI and ui_hidden ~= hidden then
@@ -100,6 +117,7 @@ local function set_fs_animation_default()
 end
 
 local function restore_fs_animation_duration()
+    if FS_ANIMATION_GEN then return end
     -- The property may be unavailable on unusual builds; default is the safe fallback.
     mp.set_property_native(
         "macos-fs-animation-duration",
@@ -107,6 +125,9 @@ local function restore_fs_animation_duration()
     )
 end
 
+-- Only called in fs_animation=gen mode; fs_animation=pip never arms, so your
+-- configured macos-fs-animation-duration stays in effect for ordinary
+-- fullscreen toggles.
 local function arm_fs_animation()
     if fs_animation_armed then return end
     fs_animation_armed = true
@@ -121,17 +142,14 @@ local function track_normal_geometry(value)
     if normal.geometry_is_fallback and geometry == normal.geometry then
         return
     end
-    normal.geometry = geometry
-    normal.geometry_is_fallback = false
+    set_geometry_state(normal, geometry)
 end
 
 local function restore_geometry(geometry, is_fallback)
-    normal.geometry = geometry
-    normal.geometry_is_fallback = is_fallback
+    set_geometry_state(normal, geometry, is_fallback)
     mp.set_property("geometry", geometry)
     -- Store mpv's canonical spelling, since it may normalize geometry strings.
-    normal.geometry = mp.get_property("geometry") or geometry
-    normal.geometry_is_fallback = is_fallback
+    set_geometry_state(normal, mp.get_property("geometry") or geometry, is_fallback)
 end
 
 -- Keeps track of the windowed state. Called with no arguments for a full
@@ -190,8 +208,7 @@ local function save_pip_state()
 
     saved.keepaspect = normal.keepaspect
     saved.border     = normal.border
-    saved.geometry   = normal.geometry_is_fallback and "" or (normal.geometry or "")
-    saved.geometry_is_fallback = false
+    set_geometry_state(saved, normal.geometry_is_fallback and "" or normal.geometry, false)
 
     -- mpv documents current-window-scale as the last windowed size even while
     -- fullscreen. Capture it before changing the fullscreen window's target frame.
@@ -201,15 +218,14 @@ local function save_pip_state()
 
     if saved.geometry == "" and not saved.fs and not normal.geometry_is_fallback then
         local g = mp.get_property("geometry")
-        if g and g ~= "" then saved.geometry = g end
+        if g and g ~= "" then set_geometry_state(saved, g, false) end
     end
 
     -- With fs=yes at startup, an unset geometry is still a known default: mpv
     -- places an ordinary window in the centre. Make that position explicit so
     -- the PiP geometry cannot become the only saved windowed position.
     if saved.geometry == "" then
-        saved.geometry = NORMAL_GEOM
-        saved.geometry_is_fallback = true
+        set_geometry_state(saved, NORMAL_GEOM, true)
     end
 end
 
@@ -235,8 +251,6 @@ local function restore_window_state()
     if saved.geometry and saved.geometry ~= "" then
         -- Position updates require force-window-position=yes on affected mpv builds.
         restore_geometry(saved.geometry, saved.geometry_is_fallback)
-    elseif saved.window_scale then
-        mp.set_property_native("window-scale", saved.window_scale)
     end
 
     if saved.max and mp.get_property_native("window-maximized") ~= true then
@@ -264,6 +278,8 @@ end
 -- ===== PiP transitions ===================================================
 
 local function enter_pip()
+    -- Invalidate any delayed fullscreen retarget from an older transition.
+    fullscreen_retarget_generation = fullscreen_retarget_generation + 1
     save_pip_state()
 
     is_pip = true
@@ -286,6 +302,8 @@ local function enter_pip()
 end
 
 local function exit_pip()
+    -- A pending callback belongs to the transition being exited, not this one.
+    fullscreen_retarget_generation = fullscreen_retarget_generation + 1
     entering_pip_from_fullscreen = false
     is_pip = false
     pip_cancelled_by_fullscreen = false
@@ -327,6 +345,10 @@ for _, prop in ipairs({
 end
 
 mp.observe_property("fullscreen", "bool", function(_, value)
+    -- Every fullscreen transition invalidates retarget callbacks from the prior
+    -- fullscreen session. Explicit PiP commands also invalidate them immediately.
+    fullscreen_retarget_generation = fullscreen_retarget_generation + 1
+
     if value == true then
         if is_pip then
             -- User pressed 'f' / double-clicked in PiP: leave PiP but stay in the
@@ -345,12 +367,32 @@ mp.observe_property("fullscreen", "bool", function(_, value)
         if pip_cancelled_by_fullscreen then
             -- This fullscreen session was entered from PiP, so the frame its exit
             -- animation glides towards is the PiP corner, while the session has to
-            -- end at the normal windowed rect. Retargeting it here would mean
-            -- resizing the window while fullscreen, so make this one exit instant
-            -- instead of gliding to the wrong corner. Delayed, because the "enter
+            -- end at the normal windowed rect. Delayed, because the "enter
             -- fullscreen" animation is starting right now and must not be cut short.
+            -- Capture this fullscreen session's generation. Any later fullscreen
+            -- change or explicit PiP command invalidates this timeout.
+            local generation = fullscreen_retarget_generation
             mp.add_timeout(0.6, function()
-                if pip_cancelled_by_fullscreen and mp.get_property_native("fullscreen") then
+                if generation ~= fullscreen_retarget_generation then return end
+                if not (pip_cancelled_by_fullscreen and mp.get_property_native("fullscreen")) then
+                    return
+                end
+                if FS_ANIMATION_GEN then
+                    -- Keep the normal exit animation, but retarget the stored
+                    -- windowed frame from the PiP corner to the real normal
+                    -- geometry, so the glide ends in the right place. Writing
+                    -- geometry while fullscreen only rewrites that stored frame
+                    -- (see file header), and this runs after the enter animation,
+                    -- so it does not cancel it.
+                    if saved.geometry and saved.geometry ~= "" then
+                        mp.set_property("geometry", saved.geometry)
+                    end
+                else
+                    -- Make this one exit instant instead of gliding to the wrong
+                    -- corner; the fullscreen-exit handler below then places the
+                    -- window correctly via restore_window_state(), and
+                    -- restore_fs_animation_duration() puts your configured value
+                    -- back.
                     mp.set_property_native("macos-fs-animation-duration", 0)
                 end
             end)
@@ -376,27 +418,47 @@ mp.observe_property("fullscreen", "bool", function(_, value)
     update_normal_state()
 end)
 
+-- Re-assert the saved normal geometry whenever a VO reconfig or playback
+-- restart fires while we are in the pip-cancelled-by-fullscreen session.
+-- Option changes (e.g. battery-profile switches: video-sync, glsl-shaders-clr)
+-- can trigger these events, which cause mpv's macOS layer to overwrite
+-- unfsContentFrame (the frame the fullscreen-exit animation glides towards)
+-- with the video's natural pixel size, undoing the retargeting we did in the
+-- 0.6-s timer above.  Writing geometry while the window is still fullscreen is
+-- safe: it only rewrites that stored frame without moving the window.
+local function pip_guard_retarget()
+    if not (pip_cancelled_by_fullscreen and mp.get_property_native("fullscreen")) then return end
+    if FS_ANIMATION_GEN and saved.geometry and saved.geometry ~= "" then
+        mp.set_property("geometry", saved.geometry)
+    end
+end
+mp.register_event("playback-restart", pip_guard_retarget)
+mp.register_event("video-reconfig",   pip_guard_retarget)
+
 -- ===== Startup ===========================================================
 
--- Arm the fullscreen animation once startup is over: mpv.conf's fs=yes and the
--- initial placement must stay instant, every later transition should animate.
--- playback-restart fires when the first frame is up, i.e. after that placement.
-local function arm_later(delay)
-    mp.add_timeout(delay, arm_fs_animation)
+-- fs_animation=gen: arm the fullscreen animation once startup is over, so
+-- mpv.conf's fs=yes and the initial placement stay instant and every later
+-- transition animates. fs_animation=pip never registers any of this, leaving
+-- your configured value (e.g. 0) in effect for ordinary fullscreen toggles.
+if FS_ANIMATION_GEN then
+    local function arm_later(delay)
+        mp.add_timeout(delay, arm_fs_animation)
+    end
+
+    mp.register_event("playback-restart", function() arm_later(0.3) end)
+
+    mp.observe_property("vo-configured", "bool", function(_, value)
+        if value then arm_later(1.5) end
+    end)
+
+    if mp.get_property_native("vo-configured") then
+        arm_later(1.5)
+    end
+
+    -- Safety net, in case neither of the above fires.
+    arm_later(8.0)
 end
-
-mp.register_event("playback-restart", function() arm_later(0.3) end)
-
-mp.observe_property("vo-configured", "bool", function(_, value)
-    if value then arm_later(1.5) end
-end)
-
-if mp.get_property_native("vo-configured") then
-    arm_later(1.5)
-end
-
--- Safety net, in case neither of the above fires.
-arm_later(8.0)
 
 -- Seed properties that remain meaningful while fullscreen. The full refresh
 -- below deliberately skips fullscreen because its geometry may be the PiP target.

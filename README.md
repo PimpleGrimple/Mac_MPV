@@ -1,55 +1,47 @@
 > [!NOTE]  
-> Not tested on MBP if you know a confirmed working setup to allow hdr passthrough there pls send.
+> Not tested on MacBook Pro. If you know a confirmed working setup for HDR passthrough on MBP, please open an issue or PR.
 
 ---
 
 ## Table of Contents
 
-1. [Highlights](#1-highlights)
-2. [Custom MPV Development Build (`mpv.zip`)](#2-custom-mpv-development-build-mpvzip)
-3. [System Dependencies](#3-system-dependencies)
-4. [Installation & Setup](#4-installation--setup)
-5. [MPV Launcher (`mpv-launcher.py`) & System Integration](#5-mpv-launcher-mpv-launcherpy--system-integration)
-6. [Browser Extensions & Native Messaging](#6-browser-extensions--native-messaging)
-7. [Scripts & Automation Suite](#7-scripts--automation-suite)
-8. [Credits & References](#8-credits--references)
-9. [License](#9-license)
+1. [Custom MPV Development Build (`mpv.zip`)](#1-custom-mpv-development-build-mpvzip)
+2. [System Dependencies](#2-system-dependencies)
+3. [Installation & Setup](#3-installation--setup)
+4. [MPV Launcher (`mpv-launcher.py`) & System Integration](#4-mpv-launcher-mpv-launcherpy--system-integration)
+5. [Browser Extension & Native Messaging](#5-browser-extension--native-messaging)
+6. [Scripts & Automation Suite](#6-scripts--automation-suite)
+7. [Credits & References](#7-credits--references)
+8. [License](#8-license)
 
 ---
 
-## 1. Highlights
+## 1. Custom MPV Development Build (`mpv.zip`)
 
-- **Custom-Patched MPV Dev**: Standalone `mpv.app` compiled from upstream dev (`master`) with inverse tone mapping (ITM) color-fix patches, macOS CoreAudio multi-channel fixes, and native VapourSynth bridge support.
-- **Browser setup**: Universal smart launcher (`mpv-launcher.py`), Chromium MediaBlocker extension with format and bitrate inspection.
----
-
-## 2. Custom MPV Development Build (`mpv.zip`)
-
-The custom development build is built with the following toolchain parameters and flags:
-- **Base Version**: `mpv master` (commit `g36abaa32d-dirty`, report version `0.41.0-dev`).
-- **libplacebo Version**: `v7.360.1` (with Vulkan, LCMS2, and the SDR->HDR ITM desaturation patch applied).
-- **VapourSynth Integration**: Linked against modern VapourSynth header and dylib tree (`--vf=vapoursynth` bridge enabled via dynamic runtime loader).
-- **CoreAudio Fix**: Anki commit `a9a9e5e` channel-map fix applied to `audio/out/ao_coreaudio.c`.
-- **Packaging**: Self-contained `.app` bundle with internal dynamic library paths re-linked (`install_name_tool`) and standalone MoltenVK ICD manifest embedded.
+Custom development build compiled with the following flags and integrations:
+- **Base Version**: `mpv master` (commit `g82667e3cb-dirty`, version report `0.41.0-dev`).
+- **libplacebo Version**: `v7.373.0` (Metal backend fork with `gpu-api=metal`, Vulkan, LCMS2, and SDR-to-HDR ITM desaturation patch).
+- **Integrated Disc Support**: Linked with `libbluray`, `dvdnav`, and `dvda` for native Blu-ray and DVD playback.
+- **VapourSynth Integration**: Dynamic runtime bridge (`--vf=vapoursynth`) linked against modern VapourSynth.
+- **CoreAudio Fix**: Channel-map fix (commit `a9a9e5e`) applied to `audio/out/ao_coreaudio.c`.
+- **Packaging**: Self-contained `.app` bundle with internal dynamic library paths re-linked (`install_name_tool`) and embedded MoltenVK ICD manifest.
 
 ---
-## 3. System Dependencies
+## 2. System Dependencies
 
 ### Homebrew Packages
 ```bash
-brew install yt-dlp ffmpeg deno alass subliminal dovi_tool hdr10plus_tool mkvtoolnix
+brew install yt-dlp ffmpeg deno alass subliminal mkvtoolnix
 ```
 
 | Package | Required By | Purpose |
 | :--- | :--- | :--- |
 | `yt-dlp` | ModernX, SelectFormat, Cookie Cache, Launcher | Media stream extraction & format selection |
-| `ffmpeg` | ReplayGain, SmartCut, AutoSubSync, Auto Brightness | Loudness scanning, GOP trimming, HDR analysis |
+| `ffmpeg` | ReplayGain, SmartCut, AutoSubSync, Remux | Loudness scanning, GOP trimming, subtitle sync, remuxing |
 | `deno` | yt-dlp | Fast JavaScript engine for YouTube extraction challenges |
 | `alass` | AutoSubSync (`scripts/autosubsync/`) | Voice-activity subtitle synchronization |
 | `subliminal` | Subtitles (`scripts/subtitles.lua`) | Subtitle searching & download |
-| `dovi_tool` | Auto Brightness (`scripts/auto-brightness/`) | Dolby Vision RPU bitstream metadata extraction |
-| `hdr10plus_tool` | Auto Brightness (`scripts/auto-brightness/`) | HDR10+ dynamic metadata extraction |
-| `mkvtoolnix` | VapourSynth (`vsprocess`) | Container remuxing and chapter preservation |
+| `mkvtoolnix` | Chapter Maker (`scripts/chapter_maker.lua`) | Chapter embedding and MKV metadata editing |
 
 ### Python Environments
 * **SmartCut**:
@@ -60,7 +52,7 @@ brew install yt-dlp ffmpeg deno alass subliminal dovi_tool hdr10plus_tool mkvtoo
 
 ---
 
-## 4. Installation & Setup
+## 3. Installation & Setup
 
 1. **Clone the Configuration**:
    ```bash
@@ -68,75 +60,108 @@ brew install yt-dlp ffmpeg deno alass subliminal dovi_tool hdr10plus_tool mkvtoo
    chmod +x ~/.config/mpv/mpv-launcher.py
    ```
 
-2. **Deploy the Custom MPV Build**:
-   Unpack `mpv.zip` into your `/Applications` or user `~/Applications` folder:
+2. **Install MPV App**:
+   Unpack `mpv.zip` into `/Applications` (or `~/Applications`):
    ```bash
    unzip -q ~/.config/mpv/mpv.zip -d /Applications/
    ```
 
 3. **Install Fonts**:
-   Unpack `fonts.zip` and install the fonts into macOS Font Book:
+   Unpack `fonts.zip` and open the fonts to install them into Font Book:
    ```bash
    unzip -o ~/.config/mpv/fonts.zip -d ~/.config/mpv/
    ```
    Install `fluent-system-icons.ttf`, `Segoe UI Semibold.ttf`, and `AOTFShinGoProMedium.otf` from `~/.config/mpv/fonts/`.
 
-4. **Configure yt-dlp (Optional)**:
+4. **Directory Setup & Aliases**:
+   Create screenshot/config folders and symlinks:
    ```bash
-   mkdir -p ~/.config/yt-dlp
+   mkdir -p ~/.config/yt-dlp ~/Pictures/mpv/screenshots
+   ln -s ~/Pictures/mpv ~/.config/mpv/screenshot
+   ln -s ~/.config/yt-dlp/config ~/.config/mpv/"ytdlp config"
+   ```
+
+5. **Configure yt-dlp**:
+   ```bash
    cat << 'EOF' > ~/.config/yt-dlp/config
+   # Anti-Bot & Auth
+   #--extractor-args "youtubepot-wpc:browser_path=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+   #--impersonate chrome
    --cookies "~/.config/mpv/cache/scripts/cookies.txt"
-   --force-ipv4 --retries 10 --fragment-retries 10 --socket-timeout 30 --concurrent-fragments 4
-   --embed-thumbnail --embed-metadata --embed-subs --sub-langs "en.*,-live_chat" --merge-output-format mkv
+   #--mark-watched # not working
+
+   # Network Stability
+   --force-ipv4
+   --retries 10
+   --fragment-retries 10
+   --socket-timeout 30
+   --concurrent-fragments 4
+   --compat-options allow-unsafe-ext
+   #--downloader=ffmpeg
+   #--format="bestvideo[height<=?1440]+bestaudio/best"
+
+   # Post-Processing & Output
+   --embed-thumbnail
+   --embed-metadata
+   --embed-subs
+   --sub-langs "en.*,-live_chat"
+   --no-write-comments
+   --remux-video mkv
+   --merge-output-format mkv
    EOF
    ```
 
----
-
-## 5. MPV Launcher (`mpv-launcher.py`) & System Integration
-
-`mpv-launcher.py` coordinates macOS application launching (`open -n -b io.mpv`), single-instance IPC queuing (`~/.config/mpv/cache/fallback.sock`), optical disc mounting, and browser native messaging.
-
-### Methods of Use
-
-* **Method 1: Zero-Argument Smart Trigger (Universal Hotkey)**  
-  When triggered without arguments (e.g., via Raycast, Alfred, Shortcuts, or `skhd`):
-  1. **Finder Selection**: If files or folders are highlighted in Finder, plays them immediately.
-  2. **Clipboard Fallback**: If nothing is selected, inspects clipboard (`pbpaste`) for a web URL or local path and plays it.
-  > *Tip: Bind `Cmd+Opt+V` to `~/.config/mpv/mpv-launcher.py`.*
-
-* **Method 2: Automator Quick Action (Right-Click Context Menu)**  
-  1. Open **Automator.app** $\rightarrow$ **Quick Action**.
-  2. Set **Workflow receives current**: `files or folders` in `Finder.app`.
-  3. Add **Run Shell Script** (`/bin/zsh`, pass input `as arguments`):
-     ```zsh
-     ~/.config/mpv/mpv-launcher.py "$@"
-     ```
-  4. Save as **"Open with MPV"**.
-
-* **Method 3: Terminal / CLI**  
-  ```bash
-  # Files or playlists
-  ~/.config/mpv/mpv-launcher.py video1.mkv video2.mp4
-
-  # Recursive folder playback
-  ~/.config/mpv/mpv-launcher.py ~/Movies/Series/Season-01/
-
-  # Web streaming
-  ~/.config/mpv/mpv-launcher.py "https://www.youtube.com/watch?v=..."
-  ```
-
-* **Method 4: DVD & Blu-ray Detection**  
-  Folders containing `VIDEO_TS` or `BDMV` are automatically mounted via `--dvd-device=... dvd://` or `--bluray-device=... bluray://`.
+6. **Set Up macOS Quick Action / Keybind**:
+   Create the Automator Quick Action(s) as documented in [Section 4](#4-mpv-launcher-mpv-launcherpy--system-integration) and assign hotkeys in **System Settings** → **Keyboard** → **Keyboard Shortcuts...** → **Services** → **General**.
 
 ---
 
-## 6. Browser Extensions & Native Messaging
+## 4. MPV Launcher (`mpv-launcher.py`) & System Integration
 
-* **Play in MPV**: [Chrome Web Store](https://chromewebstore.google.com/detail/njlpgpceeekkodgehpehlngpoeilcncf?utm_source=item-share-cb) — Adds browser toolbar buttons and context menu actions to send links directly to mpv.
-* **Media Blocker (`MediaBlocker/`)**: Unpacked Manifest V3 extension in `~/.config/mpv/MediaBlocker/`. Intercepts media stream requests (`.m3u8`, `.mpd`, `.mp4`) before web players initialize. Provides instant quality and bitrate selection, codec inspection (AV1, HEVC, VP9, H.264), direct stream playback, and `#MBSTREAM` payload copying.
+`mpv-launcher.py` handles application launching (`open -n -b io.mpv`), single-instance IPC queuing (`~/.config/mpv/cache/fallback.sock`), optical disc mounting, and browser native messaging.
 
-### Register Native Messaging Host
+### Automator Quick Actions
+
+You can set up either (or both) of these Quick Actions in **Automator.app**:
+
+* **1. Universal Hotkey (Finder + Clipboard Fallback)**  
+  - In Automator: create a **Quick Action**, set workflow receives **no input** in **any application**.
+  - Add **Run Shell Script** (`/bin/zsh`):
+    ```zsh
+    $HOME/.config/mpv/mpv-launcher.py
+    ```
+  - **Behavior**: Checks highlighted items in Finder, or falls back to playing clipboard URLs/paths via macOS `pbpaste`.  
+  - *Trade-off*: Can occasionally be inconsistent at reading Finder selection, and will not appear in Finder's right-click context menu.
+
+* **2. Finder Right-Click Menu (Direct Selection)**  
+  - In Automator: create a **Quick Action**, set workflow receives **files or folders** in **Finder.app**.
+  - Add **Run Shell Script** (`/bin/zsh`, pass input **as arguments**):
+    ```zsh
+    "$HOME/.config/mpv/mpv-launcher.py" "$@"
+    ```
+  - **Behavior**: Appears directly in Finder's right-click menu (**Quick Actions** → **MPV**) and reliably opens the selected files/folders.  
+  - *Trade-off*: Disables the clipboard fallback function because input is strictly bound to selected files.
+
+Assign shortcuts for either service in **System Settings** → **Keyboard** → **Keyboard Shortcuts** → **Services** → **General**.
+
+### DVD & Blu-ray Auto-Mount
+Folders containing `VIDEO_TS` or `BDMV` are automatically mounted via `--dvd-device=... dvd://` or `--bluray-device=... bluray://`.
+
+---
+
+## 5. Browser Extension & Native Messaging
+
+* **Media Blocker (`MediaBlocker/`)**: Unpacked Manifest V3 extension in `~/.config/mpv/MediaBlocker/` (merges stream detection and Play in MPV into one extension).
+  - Intercepts stream requests (`.m3u8`, `.mpd`, `.mp4`) before web players load. Provides quality/bitrate selection, codec inspection (AV1, HEVC, VP9, H.264), direct stream playback, and `#MBSTREAM` payload copying.
+  - Adds a one-click **Play in MPV** button on YouTube, context menu options, and toolbar popup (`Alt+M` popup menu, `Alt+P` play active tab).
+
+### Setup
+
+1. **Load Extension in Chrome**:
+   - Open `chrome://extensions` and enable **Developer mode**.
+   - Click **Load unpacked** and select `~/.config/mpv/MediaBlocker/`.
+
+2. **Register Native Messaging Host**:
 ```bash
 mkdir -p ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts
 cat << EOF > ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.playinmpv.host.json
@@ -146,71 +171,72 @@ cat << EOF > ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/c
   "path": "$HOME/.config/mpv/mpv-launcher.py",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://njlpgpceeekkodgehpehlngpoeilcncf/",
-    "chrome-extension://phbnnepeojngejmloimciipldpddlnii/"
+    "chrome-extension://jejmniblnialndgjpkpfammnohfgljdi/"
   ]
 }
 EOF
 ```
+> [!NOTE]
+> A fixed public key is embedded in `manifest.json`, ensuring the extension ID (`jejmniblnialndgjpkpfammnohfgljdi`) stays identical across all machines.
 
 ---
 
-## 7. Scripts & Automation Suite
+## 6. Scripts & Automation Suite
 
-### Video Restoration & Cadence
-* **Deinterlace (`scripts/deint.lua`)**:
-  - Bound to `x`. Runs deep cadence analysis on the active video using `vsdetect` from the VapourSynth bundle.
-  - Instantly reveals progressive vs. interlaced status, 3:2 pulldown cadence, repeated frame ratios, field order, and suggested deinterlacing strategies.
-  - Applies the best basic mpv filters and shaders to deinterlace it
-* **SmartCut (`scripts/smartcut/`)**:
-  - Frame-accurate lossless cutter. Re-encodes only the GOP-boundary edges with CRF 10 and stream-copies all intermediate frames.
-  - `k`: Mark A / Mark B $\rightarrow$ trigger background cut | `K`: Cycle modes (`smartcut`, `compress`, `pansmash`, `gif`) | ` ` ` (backtick): Process console.
-
-### Unified Auto-Skip Suite (`scripts/auto-skip/`)
-Consolidates all segment skipping into an efficient, centralized engine:
-* **AniSkip (`aniskip.lua`)**: Queries the AniSkip API to automatically or manually skip anime opening and ending sequences (`Alt+s` / `ENTER`).
-* **SponsorBlock (`sponsorblock.lua` & `sponsorblock.py`)**: Skips YouTube sponsor segments, intros, outros, and self-promotion. Vote on segments with `H`.
-* **TheIntroDB (`theintrodb.lua`)**: Automatically skips TV show intro sequences using community timestamps.
-* **Local Chapters (`localchapters.lua`)**: Matches chapter titles for local opening/ending skips.
-
-### Display & Backlight Control
-* **Auto Brightness & CABC (`scripts/auto-brightness/`) [WIP may be removed]**:
-  - Dynamic Content-Adaptive Backlight Control (CABC) and optical gain management for Liquid Retina / XDR panels.
-  - Reduces backlight on dark scenes to minimize IPS glow, applying highlight compensation via GLSL hook (`cabc_gain.hook`).
-  - Fast Dolby Vision and HDR10+ metadata extraction via `dovi_tool` and `hdr10plus_tool`.
-  - `Alt+b`: HUD | `Ctrl+g`: Optical gain | `Alt+h`: Highlight recovery | `Alt+l`: Live CABC.
-* **Dynamic 3D LUT Switcher (`scripts/lut.lua`)**: Switch `.cube` / `.3dl` color grading LUTs in `~/.config/mpv/luts/` (`e` / `E`).
-* **Battery Saver (`scripts/battery.lua`)**: Monitors power state via `pmset` and toggles between high-power shaders and efficient battery profiles (`B`).
-
-### Audio & Normalization
-* **ReplayGain (`scripts/replaygain.lua`)**: EBU R128 loudness normalization scanning via `ffmpeg` to `-14 LUFS`.
-  - `meta+s`: Scan current file | `meta+i`: Show stats | `meta+up`/`meta+down`: $\pm 1\text{ dB}$ | `meta+b`: Hardbake tags | `meta+r`: Reset.
-
-### Subtitles & Audio Sync
-* **Subtitles & Lyrics (`scripts/subtitles.lua`)**: Online subtitle search via Subliminal; synchronized karaoke lyrics via Musixmatch & LRCLIB.
-  - `q` / `Q`: Smart download / manual search primary subtitles | `Ctrl+q` / `Ctrl+Q`: Secondary subtitles.
-* **AutoSubSync (`scripts/autosubsync/`)**: Voice-activity subtitle synchronization against audio track via `alass` (`n`).
-* **Sub-Pause & Sub-Skip (`scripts/sub-pause.lua`, `scripts/sub-skip.lua`)**:
-  - `'`: Auto-pause at end of subtitle | `;`: Jump to next subtitle line | `Alt+l`: Replay line | `\`: Toggle silence skip.
-* **Styles Menu (`scripts/styles.lua` + `script-modules/menu.lua`)**:
-  - Interactive on-screen menu (`Alt+u`) for cycling custom subtitle font styles and appearance presets defined in `styles.conf`.
-
-### Navigation & Management
-* **ModernX OSC (`scripts/modernx.lua`)**: Fluent-design on-screen controller with seekbar hover thumbnails (`scripts/thumbfast.lua`).
-* **Format Selector (`scripts/select-format.lua`)**: In-player quality and stream selector for YouTube and multi-track media (`y`).
-* **Playlist Manager (`scripts/playlist-manager.lua`)**: Interactive playlist navigation and file management (`p`).
-* **Screenshot Folder (`scripts/screenshot-folder.lua`)**: Saves titled screenshots, video frame grabs, and copies directly to clipboard (`s`, `j`, `O`).
-* **CopyPaste (`scripts/copypaste.lua`)**: Clipboard stream URL pasting and path copying (`meta+c`, `meta+v`).
-* **Picture-in-Picture (`scripts/pip.lua`)**: Toggles borderless, aspect-locked floating window (`Alt+p`).
-* **Auto Save State (`scripts/auto-save.lua`)**: Persists playback position, selected audio track, and subtitle track across sessions.
+* **deint.lua**:
+  - Bound to `x`. Runs cadence analysis via `vsdetect` to detect progressive/interlaced video, 3:2 pulldown, and field order.
+  - Automatically applies the best mpv filters and shaders to deinterlace.
+* **smartcut**:
+  - Frame-accurate lossless cutter. Re-encodes only GOP-boundary edges with CRF 10 and stream-copies intermediate frames.
+  - `k`: Mark A / Mark B → trigger background cut | `K`: Cycle modes (`smartcut`, `compress`, `pansmash`, `gif`) | `` ` `` (backtick): Process console.
+* **remux**:
+  - Lossless remuxing and track manager via `ffmpeg -c copy`. Reorders and toggles video, audio, and subtitle tracks, delays, chapters, and font attachments.
+  - `Ctrl+R`: Toggle menu | `Ctrl+Alt+r`: Immediate export.
+* **auto_skip**:
+  Consolidates all segment skipping into one engine:
+  - **aniskip.lua**: Skips anime opening and ending sequences via the AniSkip API (`Alt+s` / `ENTER`).
+  - **sponsorblock.lua**: Skips YouTube sponsor segments, intros, outros, and self-promotion.
+  - **theintrodb.lua**: Skips TV show intro sequences using community timestamps.
+  - **localchapters.lua**: Matches chapter titles for local opening/ending skips.
+  - `Alt+s`: Toggle auto-skip | `Alt+R`: Force rescan.
+* **auto_brightness.lua**:
+  - Automatically adjusts target peak brightness for SDR, inverse tone mapping, and HDR on Liquid Retina / XDR displays.
+* **lut.lua**: Switch `.cube` / `.3dl` color grading LUTs in `~/.config/mpv/luts/` (`e` / `E`).
+* **battery.lua**: Monitors power state via `pmset` and toggles between high-power shaders and efficient battery profiles (`B`).
+* **replaygain.lua**: EBU R128 loudness normalization scanning via `ffmpeg` to `-14 LUFS`.
+  - `meta+s`: Scan current file | `meta+i`: Show stats | `meta+up`/`meta+down`: ±0.1 dB | `meta+b`: Hardbake tags | `meta+r`: Reset.
+* **subtitles.lua**: Online subtitle search via Subliminal; synchronized karaoke lyrics via Musixmatch & LRCLIB.
+  - `q`: Smart download primary subtitles | `Q`: Manual search.
+* **smart_subs.lua**:
+  - Automatically selects the best subtitle track matching `slang` based on priority keywords (`dialogue`, `full`, `complete`) and filters out unwanted tracks (`signs`, `songs`, `commentary`).
+* **autosubsync**: Voice-activity subtitle synchronization against audio track via `alass` (`n`).
+* **sub_pause.lua**: Auto-pause at start of subtitle (`"`), auto-pause at end of subtitle (`'`), jump to next subtitle line (`;`), replay line (`l`).
+* **sub_skip.lua**: Auto-skip or speed-up gaps between subtitle lines (`\` toggle, `|` switch speed/seek mode).
+* **styles.lua**: Interactive on-screen menu (`g-u`), forward (`u`), backward (`U`), reset default (`g-U`) for cycling custom subtitle font styles and appearance presets defined in `styles.conf`.
+* **chapter_maker.lua**:
+  - Interactive chapter creation, splitting, A-B loop conversion, renaming, and MKV embedding via `mkvpropedit`.
+  - `c`: Split chapter | `Alt+m`: Mark A-B chapter | `Alt+r`: Rename chapter | `Alt+d`: Remove chapter | `Alt+z`: Undo | `Alt+e`: Export sidecar | `Alt+w`: Embed into MKV.
+* **modernx.lua**: Fluent-design on-screen controller with seekbar hover thumbnails (`thumbfast.lua`).
+* **thumbfast.lua**: On-the-fly seekbar thumbnail generation.
+* **selectformat.lua**: In-player quality and stream selector for YouTube and multi-track media (`y`).
+* **playlist_manager.lua**: Interactive playlist navigation and file management via `mp.input` (`meta+p`: Menu | `meta+f`: Favorite | `meta+W`: Watch later | `ctrl+e`: Export playlist).
+* **screenshot_folder.lua**: Saves titled screenshots to media-specific folders and copies directly to clipboard (`j`: Video frame grab | `Alt+j`: Screenshot with subtitles | `J`: Window screenshot).
+* **copypaste.lua**: Clipboard stream URL pasting and path copying (`meta+c`: Copy path | `meta+v`: Paste and play | `meta+C`: Copy subtitle | `meta+alt+c`: Copy timestamp | `Alt+o`: Reveal in Finder / open URL).
+* **pip.lua**: Toggles borderless, aspect-locked floating window (`Alt+p` / `π`).
+* **auto_save.lua**: Persists playback position, selected audio track, and subtitle track across sessions.
+* **cookie_cache.lua**: Extracts and caches browser cookies for yt-dlp playback.
 
 ---
 
-## 8. Credits & References
+## 7. Credits & References
 
 - **Base Setup**: [zydezu/mpvconfig](https://github.com/zydezu/mpvconfig)
 - **Shaders, Profiles & LUTs**: [hooke007/mpv_PlayKit](https://github.com/hooke007/mpv_PlayKit)
 - **Shaders, Profiles**: [he2a/mpv-config](https://github.com/he2a/mpv-config)
+- **AltScale**: [garamond13/AltScale](https://github.com/garamond13/AltScale)
+- **libplacebo Metal Fork**: [ab300819/libplacebo (metal-backend)](https://github.com/ab300819/libplacebo/tree/metal-backend)
+- **The Stream Detector**: [54ac/stream-detector](https://github.com/54ac/stream-detector) (stream detection basis for Media Blocker)
+- **Play in MPV Extension**: [franciscobecheli/play-in-mpv](https://github.com/franciscobecheli/play-in-mpv) by Francisco Becheli (native host bridge and player integration basis for Media Blocker)
 - **SmartCut**: [skeskinen/smartcut](https://github.com/skeskinen/smartcut)
 - **AutoSubSync**: [joaquinteixeira/mpv-autosubsync](https://github.com/joaquinteixeira/mpv-autosubsync) & [kaegi/alass](https://github.com/kaegi/alass)
 - **SponsorBlock**: [Ajayyy/SponsorBlock](https://github.com/ajayyy/SponsorBlock) & [po5/mpv_sponsorblock](https://github.com/po5/mpv_sponsorblock)
@@ -223,6 +249,6 @@ Consolidates all segment skipping into an efficient, centralized engine:
 
 ---
 
-## 9. License
+## 8. License
 
 This configuration, custom scripts, and extensions (`MediaBlocker`, `mpv-launcher.py`, build scripts) are licensed under the [MIT License](LICENSE). Third-party scripts, shaders, and tools remain licensed under their respective original terms.

@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA41EDT5hOT79bLboFHQIVuLiP4LrGIb2ywJiXq5Af6SSxMgwQ9TenPCuGBxko0Gl7Ym8Gcxw3kzPdpnruDtxsOk0LxrNv3Gx0MAhThWuSBzZKM7LMKfpFwj3vZEW43qbd8k1zIwvC61XAWKu+WcAA32mM9IxuFPyOtCWNpQUqnZEMKj8fJSbOxFJXszRWfcVhKOjSj042ev9r3PXTSea42d2LeH4OEQ5gfVTsL8g7BuP64CUl+v8YO/3nThWw0CFm+VcvBhlHPd65Z9mEoGgg5nw5dJzqpmn5RE6B9Oo+AcP9JvvxrPngkFsu+I11hawZtjAkszAYE+hFfXFi4DjlFQIDAQAB",
   "name": "Media Blocker",
-  "version": "3.60",
-  "description": "Intercepts and blocks stream URLs (m3u8, mp4, etc.) and shows a panel with a open-in-mpv or download button.",
+  "version": "3.75",
+  "description": "Blocks stream URLs (m3u8, mp4, etc.) and lists them in the toolbar popup with open-in-mpv and download; one-click Play in MPV for YouTube. No in-page UI.",
   "permissions": [
     "webRequest",
     "declarativeNetRequest",
@@ -18,20 +19,54 @@
   "background": {
     "service_worker": "background.js"
   },
+  "action": {
+    "default_title": "Media Blocker",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "128": "icon128.png"
+    }
+  },
   "content_scripts": [
     {
       "matches": [
         "<all_urls>"
       ],
       "js": [
+        "mpv-bridge.js",
+        "site-adapters.js",
         "content.js"
       ],
       "all_frames": true,
       "match_about_blank": true,
       "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "youtube-button.js"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "icons": {
     "128": "icon128.png"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+M",
+        "mac": "Alt+M"
+      },
+      "description": "Open the Media Blocker menu"
+    },
+    "play-in-mpv": {
+      "suggested_key": {
+        "default": "Alt+P",
+        "mac": "Alt+P"
+      },
+      "description": "Play this page in mpv"
+    }
   }
 }

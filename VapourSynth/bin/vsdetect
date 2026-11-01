@@ -1,71 +1,126 @@
 #!/bin/bash
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
 # vsdetect — Cadence and media scanner backend for vsprocess
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: vsdetect <input-file> [--fast] [--json] [--scan-hd]" >&2
+    exit 2
+fi
 
 INPUT="$1"
 FAST_MODE=0
 JSON_MODE=0
+SCAN_HD=0
 shift
 while [ $# -gt 0 ]; do
     case "$1" in
         --fast) FAST_MODE=1 ;;
         --json) JSON_MODE=1 ;;
+        --scan-hd) SCAN_HD=1 ;;
     esac
     shift
 done
 
 FFPROBE="${FFPROBE:-ffprobe}"
 FFMPEG="${FFMPEG:-ffmpeg}"
+export FFPROBE FFMPEG
 
 if [ ! -f "$INPUT" ]; then echo "ERROR: Input not found" >&2; exit 1; fi
 
-PROBE=$("$FFPROBE" -v quiet -print_format json -show_streams -show_format "$INPUT" 2>/dev/null)
+PROBE=$("$FFPROBE" -v quiet -print_format json -show_streams -show_format -i "$INPUT" 2>/dev/null)
 if [ -z "$PROBE" ]; then echo "ERROR: ffprobe failed" >&2; exit 1; fi
 
-read WIDTH HEIGHT CODEC FPS_R FO SAR DURATION AVG_FPS_R <<< $(python3 - "$PROBE" << 'PYEOF'
-import sys, json
-probe = json.loads(sys.argv[1])
-vs = next((s for s in probe.get('streams',[]) if s.get('codec_type')=='video'), {})
-fmt = probe.get('format', {})
-print(f"{vs.get('width', 720)} {vs.get('height', 480)} {vs.get('codec_name', 'unknown')} "
-      f"{vs.get('r_frame_rate', '30000/1001')} {vs.get('field_order', 'unknown')} "
-      f"{vs.get('sample_aspect_ratio', '1:1')} {float(fmt.get('duration', 0))} "
-      f"{vs.get('avg_frame_rate', '0/1')}")
+METADATA=$(printf '%s' "$PROBE" | python3 -c '
+import json, sys
+try:
+    probe = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+vs = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), None)
+if vs is None:
+    print("NO_VIDEO")
+    sys.exit(0)
+fmt = probe.get("format", {})
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+print(" ".join(str(x) for x in (
+    vs.get("width", 0), vs.get("height", 0), vs.get("codec_name", "unknown"),
+    vs.get("r_frame_rate", "0/1"), vs.get("field_order", "unknown"),
+    vs.get("sample_aspect_ratio", "1:1"), safe_float(fmt.get("duration")),
+    vs.get("avg_frame_rate", "0/1")
+)))
+') || { echo "ERROR: Could not parse ffprobe output" >&2; exit 1; }
+if [ "$METADATA" = "NO_VIDEO" ]; then echo "ERROR: No video stream found" >&2; exit 1; fi
+if [ -z "$METADATA" ]; then echo "ERROR: No video metadata found" >&2; exit 1; fi
+read -r WIDTH HEIGHT CODEC FPS_R FO SAR DURATION AVG_FPS_R <<< "$METADATA"
+
+FPS_FLOAT=$(python3 - "$FPS_R" <<'PYEOF'
+import sys
+try:
+    n, d = map(int, sys.argv[1].split("/", 1))
+    print(f"{n / d:.3f}" if d else "0.000")
+except Exception:
+    print("0.000")
+PYEOF
+)
+AVG_FPS_FLOAT=$(python3 - "$AVG_FPS_R" <<'PYEOF'
+import sys
+try:
+    n, d = map(int, sys.argv[1].split("/", 1))
+    print(f"{n / d:.3f}" if d else "0.000")
+except Exception:
+    print("0.000")
 PYEOF
 )
 
-FPS_FLOAT=$(python3 -c "n,d=map(int,'$FPS_R'.split('/')); print(f'{n/d:.3f}')" 2>/dev/null || echo "29.970")
-AVG_FPS_FLOAT=$(python3 -c "n,d=map(int,'$AVG_FPS_R'.split('/')); print(f'{n/d:.3f}' if d else '0.000')" 2>/dev/null || echo "0.000")
-
-# Helper: emit results (pipe-delimited or JSON)
+# Helper: emit results (pipe-delimited or JSON).
+# Pass values as arguments rather than interpolating media metadata into Python source.
 _emit() {
     local detection="$1"
+    local status dfo i_ratio p_ratio rep_ratio
+    IFS='|' read -r status dfo i_ratio p_ratio rep_ratio <<< "$detection"
     if [ "$JSON_MODE" -eq 1 ]; then
-        IFS='|' read -r STATUS DFO I_RATIO P_RATIO REP_RATIO <<< "$detection"
-        python3 -c "
-import json
+        python3 - "$WIDTH" "$HEIGHT" "$CODEC" "$FPS_R" "$FPS_FLOAT" "$FO" "$SAR" "$DURATION" \
+            "$status" "$dfo" "${i_ratio:-0}" "${p_ratio:-0}" "${rep_ratio:-0}" <<'PYEOF'
+import json, sys
+
+def integer(value):
+    try: return int(value)
+    except (TypeError, ValueError): return 0
+
+def number(value):
+    try: return float(value)
+    except (TypeError, ValueError): return 0.0
+
+(width, height, codec, fps_r, fps, field_order, sar, duration,
+ status, detected_fo, i_ratio, p_ratio, rep_ratio) = sys.argv[1:14]
 print(json.dumps({
-    'width':      int('$WIDTH'),
-    'height':     int('$HEIGHT'),
-    'codec':      '$CODEC',
-    'fps_r':      '$FPS_R',
-    'fps':        $FPS_FLOAT,
-    'field_order':'$FO',
-    'sar':        '$SAR',
-    'duration':   $DURATION,
-    'status':     '$STATUS',
-    'detected_fo':'$DFO',
-    'i_ratio':    $I_RATIO,
-    'p_ratio':    $P_RATIO,
-    'rep_ratio':  $REP_RATIO,
+    "width": integer(width), "height": integer(height), "codec": codec,
+    "fps_r": fps_r, "fps": number(fps), "field_order": field_order,
+    "sar": sar, "duration": number(duration), "status": status,
+    "detected_fo": detected_fo, "i_ratio": number(i_ratio),
+    "p_ratio": number(p_ratio), "rep_ratio": number(rep_ratio),
 }, indent=2))
-"
+PYEOF
     else
         echo "$WIDTH|$HEIGHT|$CODEC|$FPS_R|$FPS_FLOAT|$FO|$SAR|$DURATION|$detection"
     fi
+}
+
+# FFprobe's field-order tags vary by container/codec. Convert the values used
+# by the HD metadata shortcut to the tff/bff vocabulary consumed by the filters.
+normalize_field_order() {
+    case "$1" in
+        tff|tt|tb) echo "tff" ;;
+        bff|bb|bt) echo "bff" ;;
+        *) echo "unknown" ;;
+    esac
 }
 
 if [ "$FAST_MODE" -eq 1 ]; then
@@ -76,13 +131,17 @@ fi
 # ── Cheap pre-checks (no idet pass needed) ──────────────────────────────────────
 # HD content is almost never DVD-era telecine. However, if ffprobe already reports
 # an interlaced field_order (tt/bb/tb/bt), trust that and skip the scan.
-if [ "$WIDTH" -gt 720 ] || [ "$HEIGHT" -gt 576 ]; then
+if { [ "$WIDTH" -gt 720 ] || [ "$HEIGHT" -gt 576 ]; } && [ "$SCAN_HD" -eq 0 ]; then
     if [[ "$FO" == "tt" || "$FO" == "tb" || "$FO" == "bt" || "$FO" == "bb" ]]; then
-        echo "  ${WIDTH}x${HEIGHT} is HD with interlaced field_order=$FO — treating as interlaced" >&2
-        _emit "interlaced|$FO|0.000|0.000|0.000"
+        local_order=$(normalize_field_order "$FO")
+        echo "  ${WIDTH}x${HEIGHT} is HD with interlaced field_order=$FO — using metadata ($local_order)" >&2
+        _emit "interlaced|$local_order|0.000|0.000|0.000"
+    elif [ "$FO" = "progressive" ]; then
+        echo "  ${WIDTH}x${HEIGHT} is HD with progressive metadata (skipping idet; use --scan-hd to inspect)" >&2
+        _emit "progressive|unknown|0.000|0.000|0.000"
     else
-        echo "  ${WIDTH}x${HEIGHT} is HD -> progressive (skipping idet)" >&2
-        _emit "progressive|$FO|0.000|0.000|0.000"
+        echo "  ${WIDTH}x${HEIGHT} has unknown HD field-order metadata (skipping idet; use --scan-hd to inspect)" >&2
+        _emit "unknown|unknown|0.000|0.000|0.000"
     fi
     exit 0
 fi
@@ -102,17 +161,17 @@ fi
 # Soft telecine — method 2: per-frame repeat_pict scan
 # ffprobe avg_frame_rate reports 29.97 even for rff-based telecine because it
 # counts container frames, not display timing. The ground truth is the
-# repeat_pict flag set by the MPEG-2 encoder on 3-field frames.
-# Standard 3:2 pulldown → ~40% of frames have repeat_pict=1.
-# Threshold: ≥30% rff with <10% genuinely interlaced frames = soft telecine.
+# repeat_pict flag set by MPEG-2 and similar telecine-capable codecs.
+# Standard 3:2 pulldown commonly marks roughly 40% of frames with a repeat flag.
+# Threshold: ≥30% flagged frames with <10% genuinely interlaced = soft telecine.
 RFF_RESULT=$(python3 - "$INPUT" << 'RFFEOF'
-import sys, subprocess, json
+import sys, subprocess, json, os
 
 src = sys.argv[1]
-cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+cmd = [os.environ.get("FFPROBE", "ffprobe"), "-v", "error", "-select_streams", "v:0",
        "-show_frames", "-read_intervals", "%+#300",
        "-show_entries", "frame=repeat_pict,interlaced_frame",
-       "-of", "json", src]
+       "-of", "json", "-i", src]
 try:
     out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=15)
     frames = json.loads(out).get("frames", [])
@@ -123,7 +182,9 @@ total = len(frames)
 if total == 0:
     print("0 0 0"); sys.exit(0)
 
-rff   = sum(1 for f in frames if f.get("repeat_pict", 0) == 1)
+# Any positive repeat_pict value signals extra display fields; count the
+# affected frames rather than counting only the common value of exactly 1.
+rff   = sum(1 for f in frames if int(f.get("repeat_pict", 0) or 0) > 0)
 intl  = sum(1 for f in frames if f.get("interlaced_frame", 0) == 1)
 print(f"{total} {rff} {intl}")
 RFFEOF
@@ -143,7 +204,7 @@ print('1' if rff_r >= 0.30 and intl_r < 0.10 else '0')
 ")
     if [ "$IS_SOFT_TC" == "1" ]; then
         RFF_PCT=$(python3 -c "print(f'{$RFF_COUNT*100/$RFF_TOTAL:.0f}')")
-        echo "  Soft telecine (rff flags): ${RFF_COUNT}/${RFF_TOTAL} frames have repeat_pict=1 (${RFF_PCT}%)" >&2
+        echo "  Soft telecine (repeat flags): ${RFF_COUNT}/${RFF_TOTAL} frames have repeat_pict>0 (${RFF_PCT}%)" >&2
         _emit "telecine|$FO|0.000|0.000|0.000"
         exit 0
     fi
@@ -159,9 +220,15 @@ dur    = float(sys.argv[2]) if sys.argv[2] else 0
 frames = 150
 
 # Sample multiple points only when the file is long enough relative to the
-# per-sample frame count — a fixed ">120s" cutoff missed plenty of shorter
-# OVA/short-format rips that still benefit from 3-point sampling.
-if dur > (frames / 24.0) * 3:
+# actual frame rate. This avoids overlapping sample windows on high/low-fps files.
+try:
+    sample_fps = float(sys.argv[4])
+except (TypeError, ValueError):
+    sample_fps = 24.0
+if sample_fps <= 0:
+    sample_fps = 24.0
+sample_duration = frames / sample_fps
+if dur > sample_duration * 3.5:
     offsets = [dur * 0.10, dur * 0.50, dur * 0.80]
 else:
     offsets = [0.0]
@@ -202,7 +269,12 @@ i_ratio   = (agg["tff"] + agg["bff"]) / total
 p_ratio   = agg["progressive"] / total
 rep_total = agg["rep_top"] + agg["rep_bot"] + agg["rep_neither"]
 rep_ratio = (agg["rep_top"] + agg["rep_bot"]) / rep_total if rep_total else 0.0
-fo_str    = "tff" if agg["tff"] > agg["bff"] else "bff"
+if agg["tff"] > agg["bff"]:
+    fo_str = "tff"
+elif agg["bff"] > agg["tff"]:
+    fo_str = "bff"
+else:
+    fo_str = "unknown"
 
 codec = sys.argv[3].lower()
 fps   = float(sys.argv[4])
@@ -274,15 +346,20 @@ print(f"{status}|{fo_str}|{i_ratio:.3f}|{p_ratio:.3f}|{rep_ratio:.3f}")
 PYEOF
 )
 
-# Container field_order fallback — only reached when idet itself came back
-# "unknown" (near-empty/corrupt sample, all-undetermined frames, etc.).
+# Container field_order fallback — only reached when idet itself is inconclusive.
 STATUS_ONLY=$(echo "$DETECTION" | cut -d'|' -f1)
-if [ "$STATUS_ONLY" == "unknown" ]; then
+if [ "$STATUS_ONLY" = "unknown" ]; then
+    IFS='|' read -r _ DETECTED_FO I_RATIO P_RATIO REP_RATIO <<< "$DETECTION"
     case "$FO" in
-        progressive)   DETECTION=$(echo "$DETECTION" | sed 's/^unknown/progressive/') ;;
-        tt|bb|tb|bt)   DETECTION=$(echo "$DETECTION" | sed 's/^unknown/interlaced/') ;;
+        progressive) FALLBACK_STATUS="progressive"; FALLBACK_FO="unknown" ;;
+        tt|tb|tff)   FALLBACK_STATUS="interlaced"; FALLBACK_FO="tff" ;;
+        bb|bt|bff)   FALLBACK_STATUS="interlaced"; FALLBACK_FO="bff" ;;
+        *)           FALLBACK_STATUS="unknown"; FALLBACK_FO="unknown" ;;
     esac
-    echo "  idet inconclusive, falling back to container field_order=$FO" >&2
+    if [ "$FALLBACK_STATUS" != "unknown" ]; then
+        DETECTION="$FALLBACK_STATUS|$FALLBACK_FO|${I_RATIO:-0.000}|${P_RATIO:-0.000}|${REP_RATIO:-0.000}"
+        echo "  idet inconclusive, falling back to container field_order=$FO" >&2
+    fi
 fi
 
 _emit "$DETECTION"

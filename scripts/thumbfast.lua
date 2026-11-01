@@ -1,5 +1,3 @@
--- thumbfast.lua (macOS Optimized)
-
 local options = {
     socket = "",
     thumbnail = "",

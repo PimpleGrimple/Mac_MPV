@@ -6,9 +6,9 @@
 local mp = require('mp')
 local utils = require('mp.utils')
 local mpopt = require('mp.options')
--- menu.lua lives in ~~/script-modules/ (or put it next to this file)
-package.path = mp.command_native({ "expand-path", "~~/script-modules" }) .. "/?.lua;" .. package.path
-local menu = require('menu')
+-- menu_style.lua lives next to this file (or in ~~/script-modules)
+package.path = mp.command_native({ "expand-path", "~~/scripts/autosubsync" }) .. "/?.lua;" .. package.path
+local menu = require('menu_style')
 local sub = require('subtitle')
 local ref_selector
 local engine_selector
@@ -348,7 +348,7 @@ end
 ------------------------------------------------------------
 -- Menu actions & bindings
 
--- The look comes from menu.lua: the shared style (menu-* script-opts) plus optional per-script overrides, e.g.
+-- The look comes from menu_style.lua: the shared style (menu-* script-opts) plus optional per-script overrides, e.g.
 --   script-opts-append=autosubsync-menu_accent_color=ff6b71
 ref_selector = menu:new {
     items = { 'Sync with audio', 'Sync with other subtitles', 'Save current timeline' },
@@ -362,7 +362,7 @@ ref_selector = menu:new {
     },
 }
 
--- Enter / l / click / number key: menu.lua closes the menu first, then calls this
+-- Enter / l / click / number key: menu_style.lua closes the menu first, then calls this
 function ref_selector:on_select()
     self:act()
 end
