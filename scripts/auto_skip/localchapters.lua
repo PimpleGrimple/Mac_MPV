@@ -27,7 +27,7 @@ local lists = {
 
     ending_words        = {
         "ending", "ed", "nced", "credits", "outro", "end roll",
-        "エンディング", "結び",
+        "エンディング", "結び", "closing"
     },
     ending_patterns     = {
         "^%s*ed%s*%d+%s*$",

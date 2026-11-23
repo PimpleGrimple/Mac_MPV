@@ -28,8 +28,13 @@ VapourSynth/*
 VapourSynth/bin/*
 !VapourSynth/bin/vsdetect
 
+# IDE & Editor
+.vscode/
+
 # Archives and custom builds
-archive/
+archive/deprecated/
+archive/depricated/
+archive/index/
 custom-build-*/
 
 # Local macOS aliases and symlinks

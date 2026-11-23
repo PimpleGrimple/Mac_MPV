@@ -223,6 +223,10 @@ do
             return string.format("%%%02X", c:byte())
         end))
     end
+
+    function util.join_path(base, rel)
+        return utils.join_path(base, rel)
+    end
 end
 
 local cache_dirs = {}
@@ -250,8 +254,10 @@ local shared = {
 local chapters = {}
 do
     -- The file's own chapters are never replaced: reset() snapshots them on file-load
-    -- (original()), add() merges extra chapters in and keeps the list sorted.
+    -- (original()), add() merges extra chapters in, tracking them in `injected` so
+    -- rescan (restore()) drops ONLY what auto_skip added without wiping chapter_maker edits.
     local base = {}
+    local injected = {}  -- { title, time } records of every chapter auto_skip injected
 
     local function copy(list)
         local out = {}
@@ -263,22 +269,71 @@ do
         return out
     end
 
+    -- Called on file-load: full reset, clear injected tracking.
     function chapters.reset()
+        injected = {}
         base = copy(mp.get_property_native("chapter-list", {}))
+    end
+
+    -- Called when chapter_maker has finished applying its edits mid-session.
+    -- Updates the base snapshot so local scanning sees the new titles/times,
+    -- but does NOT clear `injected` — we still need to track them for Alt+R.
+    function chapters.sync_base()
+        base = copy(mp.get_property_native("chapter-list", {}))
+        -- Remove any entries from base that are known-injected so local scanning
+        -- works from chapter_maker's chapters only (same logic as original()).
+        local clean = {}
+        for _, b in ipairs(base) do
+            local is_inj = false
+            local bt = tonumber(b.time) or 0
+            for _, inj in ipairs(injected) do
+                if math.abs(bt - (tonumber(inj.time) or 0)) < 0.05 and b.title == inj.title then
+                    is_inj = true
+                    break
+                end
+            end
+            if not is_inj then clean[#clean + 1] = b end
+        end
+        base = clean
     end
 
     function chapters.original()
         return base
     end
 
-    -- Back to the file's own chapters (drops everything add() put in).
+    -- Drops ONLY the markers injected by auto_skip, leaving chapter_maker chapters intact.
     function chapters.restore()
-        mp.set_property_native("chapter-list", base)
+        if #injected == 0 then return end
+        local current = copy(mp.get_property_native("chapter-list", {}))
+        local remaining = copy(injected)  -- mutable local copy; shrinks as we match
+        local kept = {}
+        for _, ch in ipairs(current) do
+            local match_idx = nil
+            local ch_time = tonumber(ch.time) or 0
+            for idx, inj in ipairs(remaining) do
+                if math.abs(ch_time - (tonumber(inj.time) or 0)) < 0.05 and ch.title == inj.title then
+                    match_idx = idx
+                    break
+                end
+            end
+            if match_idx then
+                table.remove(remaining, match_idx)
+            else
+                kept[#kept + 1] = ch
+            end
+        end
+        injected = {}
+        mp.set_property_native("chapter-list", kept)
     end
 
     function chapters.add(list)
+        if not list or #list == 0 then return end
         local merged = copy(mp.get_property_native("chapter-list", {}))
-        for _, chapter in ipairs(list) do merged[#merged + 1] = chapter end
+        for _, chapter in ipairs(list) do
+            local item = { title = tostring(chapter.title or ""), time = tonumber(chapter.time) or 0 }
+            merged[#merged + 1] = item
+            injected[#injected + 1] = item
+        end
         table.sort(merged, function(x, y) return (x.time or 0) < (y.time or 0) end)
         mp.set_property_native("chapter-list", merged)
     end
@@ -417,8 +472,8 @@ local CHAPTER_DEDUPE_WINDOW = 2  -- online chapters this close to an existing on
 local FILES = { ["local"] = "localchapters", aniskip = "aniskip", introdb = "theintrodb" }
 
 local order, modules, category_sets = {}, {}, {}
-for name in conf.priority:gmatch("[^,%s]+") do
-    name = name:lower()
+for raw_name in conf.priority:gmatch("[^,%s]+") do
+    local name = raw_name:lower()
     if not FILES[name] then
         log.warn("unknown source in priority: '" .. name .. "' (use local, aniskip, introdb)")
     elseif not modules[name] then
@@ -514,7 +569,8 @@ end
 local function apply_chapters(mod, intervals)
     local additions = build_chapters(intervals, mod.close)
     if #additions == 0 then return end
-    chapters.add(dedupe_against(chapters.original(), additions))
+    local current = mp.get_property_native("chapter-list", {})
+    chapters.add(dedupe_against(current, additions))
 end
 
 local function parse_body(mod, body)
@@ -590,6 +646,17 @@ local function run_chain(token, sequence)
                 log.info(string.format("%s: %d markers, %d skippable", name, #intervals, #skippable))
                 skip.set(name, skippable)
                 if mod.online then apply_chapters(mod, intervals) end
+                if intervals and #intervals > 0 then
+                    local payload = {}
+                    for _, inv in ipairs(intervals) do
+                        payload[#payload + 1] = {
+                            start_time = inv.start_time,
+                            end_time = inv.end_time,
+                            label = inv.label or name,
+                        }
+                    end
+                    mp.command_native_async({"script-message", "set-sponsorblock-segments", utils.format_json(payload)}, function() end)
+                end
                 return
             end
             if reason then
@@ -633,7 +700,86 @@ local function begin_scan(rescan)
     run_chain(chain_token, sequence)
 end
 
-mp.register_event("file-loaded", function() begin_scan(false) end)
+local ready_for_path = nil  -- absolute path that chapter_maker has signalled as ready
+local ready_timer = nil
+
+-- Returns the current file's absolute path (same normalisation chapter_maker uses).
+local function current_abs_path()
+    local path = mp.get_property("path", "")
+    if path == "" then return nil end
+    -- URLs pass through as-is; local files are made absolute.
+    if not path:find("^%a[%w+.-]*://") then
+        local wd = mp.get_property("working-directory", "")
+        if wd ~= "" then
+            path = util.join_path(wd, path)
+        end
+    end
+    return path
+end
+
+local function schedule_scan()
+    if ready_timer then
+        ready_timer:kill()
+        ready_timer = nil
+    end
+    local abs = current_abs_path()
+    if not abs then return end
+
+    if ready_for_path == abs then
+        -- chapter_maker already signalled for this file; scan immediately.
+        begin_scan(false)
+    else
+        -- Wait briefly (up to 40 ms) for chapter_maker's "ready" signal.
+        -- If chapter_maker is absent or slower, the timer fires anyway.
+        ready_timer = mp.add_timeout(0.04, function()
+            ready_timer = nil
+            begin_scan(false)
+        end)
+    end
+end
+
+mp.register_script_message("chapter-maker-ready", function(path)
+    -- chapter_maker fires this after load_chapters(); path is already absolute.
+    ready_for_path = (path and path ~= "") and path or current_abs_path()
+    if ready_timer then
+        -- Timer was waiting; chapter_maker beat it — cancel and scan now.
+        ready_timer:kill()
+        ready_timer = nil
+        begin_scan(false)
+    end
+    -- If no timer is running, schedule_scan hasn't been called yet (chapter_maker
+    -- won the race) — that's fine; schedule_scan will see ready_for_path set and
+    -- call begin_scan immediately when file-loaded fires in auto_skip.
+end)
+
+mp.register_script_message("chapter-maker-updated", function(path)
+    -- chapter_maker just committed an edit. Re-anchor the base snapshot so
+    -- localchapters.scan() sees the updated titles/times; injected tracking is
+    -- preserved so Alt+R can still surgically remove the online markers.
+    chapters.sync_base()
+    local mod = modules["local"]
+    if mod and mod.scan then
+        local intervals = mod.scan()
+        local skippable = filter(intervals, "local")
+        if #skippable > 0 then
+            log.info(string.format("local (after chapter_maker edit): %d skippable", #skippable))
+            skip.set("local", skippable)
+        else
+            -- Previously-active local skips no longer valid after edit; clear them.
+            skip.set("local", {})
+        end
+    end
+end)
+
+mp.register_event("file-loaded", function() schedule_scan() end)
+mp.register_event("end-file", function()
+    if ready_timer then
+        ready_timer:kill()
+        ready_timer = nil
+    end
+    ready_for_path = nil
+    mp.command_native_async({"script-message", "set-sponsorblock-segments", "[]"}, function() end)
+end)
 
 ------------------------------------------------------------------
 -- Rescan: look the current file up again, ignoring and replacing the caches

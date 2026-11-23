@@ -3,20 +3,15 @@
 -- k   : cycle Mark A → Mark B (launches processing in current mode)
 -- K   : cycle through modes (Smart Cut / Compress / Pan Smash / GIF)
 --
+-- Options (encoder CRF/presets, GIF, pan smash, frame vs timestamp marks, ...) live in
+-- ~/.config/mpv/script-opts/smartcut.conf and are read by smartcut.py.
+--
 -- Processing runs fully detached via nohup: mpv stays responsive, and the
 -- encode survives even if you close mpv or switch to a different video.
 -- While mpv is open, output is tailed into the console (press ` to view).
 
 local mp    = require("mp")
-local msg   = require("mp.msg")
 local utils = require("mp.utils")
-local opt   = require("mp.options")
-
--- Options (override in ~/.config/mpv/script-opts/smartcut.conf)
-local options = {
-    python_path = "", -- Custom python binary path (optional). Defaults to auto-detect.
-}
-opt.read_options(options, "smartcut")
 
 local SCRIPT_DIR  = debug.getinfo(1, "S").source:match("@?(.*/)") or "./"
 local SMARTCUT_PY = SCRIPT_DIR .. "smartcut.py"
@@ -32,91 +27,52 @@ local function file_exists(path)
     return false
 end
 
--- Resolve Python binary: checks custom option, env vars, venvs, and global brew/system python
+-- PATH used for every subprocess we start (Homebrew + user bin dirs).
+local TOOL_PATH = (os.getenv("HOME") or "") .. "/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+-- Resolve Python binary: the smartcut pipx venv first, then Homebrew python.
+-- The first one that can `import av` wins. The probe prints "OK|<dir>" only
+-- if the import works; <dir> is PyAV's bundled .dylibs folder (or empty).
+local PROBE = "import av, os; d = os.path.join(os.path.dirname(av.__file__), '.dylibs'); "
+           .. "print('OK|' + (d if os.path.isdir(d) else ''))"
 local resolved_python = nil
 local resolved_av_dylibs = nil
 
 local function detect_python()
     if resolved_python then return resolved_python end
 
-    local home = os.getenv("HOME") or ""
-    local candidates = {}
-
-    -- 1. Explicit option in script-opts/smartcut.conf
-    if options.python_path ~= "" then
-        table.insert(candidates, options.python_path)
-    end
-
-    -- 2. Environment variables
-    local env_py = os.getenv("SMARTCUT_PYTHON")
-    if env_py and env_py ~= "" then table.insert(candidates, env_py) end
-    local venv_env = os.getenv("VIRTUAL_ENV")
-    if venv_env and venv_env ~= "" then table.insert(candidates, venv_env .. "/bin/python3") end
-
-    -- 3. pipx default venv location (~/.local/pipx/venvs/smartcut)
-    table.insert(candidates, home .. "/.local/pipx/venvs/smartcut/bin/python3")
-    table.insert(candidates, home .. "/.venv/bin/python3")
-
-    -- 4. Global Homebrew and system Python locations
-    table.insert(candidates, "/opt/homebrew/bin/python3")
-    table.insert(candidates, "/usr/local/bin/python3")
-    table.insert(candidates, "python3")
+    local candidates = {
+        (os.getenv("HOME") or "") .. "/.local/pipx/venvs/smartcut/bin/python3",
+        "/opt/homebrew/bin/python3",
+    }
 
     local first_existing = nil
     for _, py in ipairs(candidates) do
-        local is_bare = not py:find("/")
-        if is_bare or file_exists(py) then
-            if not first_existing then first_existing = py end
-            -- Test if PyAV is importable
-            local test_cmd = string.format(
-                'PATH="%s/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" %s -c "import av" >/dev/null 2>&1',
-                home, shell_quote(py)
-            )
-            local res = os.execute(test_cmd)
-            if res == 0 or res == true then
+        if file_exists(py) then
+            first_existing = first_existing or py
+            local p = io.popen('PATH="' .. TOOL_PATH .. '" ' .. shell_quote(py)
+                               .. " -c " .. shell_quote(PROBE) .. " 2>/dev/null")
+            local out = p and p:read("*l")
+            if p then p:close() end
+            if out and out:sub(1, 3) == "OK|" then
                 resolved_python = py
+                local d = out:sub(4)
+                if d ~= "" and file_exists(d) then resolved_av_dylibs = d end
                 break
             end
         end
     end
 
-    resolved_python = resolved_python or first_existing or "python3"
-
-    -- Find PyAV bundled dylibs directory if present
-    local dylib_cmd = string.format(
-        'PATH="%s/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" %s -c "import av, os; d=os.path.join(os.path.dirname(av.__file__), \'.dylibs\'); print(d if os.path.isdir(d) else \'\')" 2>/dev/null',
-        home, shell_quote(resolved_python)
-    )
-    local p = io.popen(dylib_cmd)
-    if p then
-        local out = p:read("*l")
-        p:close()
-        if out and out ~= "" and file_exists(out) then
-            resolved_av_dylibs = out
-        end
-    end
-
+    resolved_python = resolved_python or first_existing or candidates[2]
     return resolved_python
 end
 
 local mark_a       = nil
 local mark_a_frame = nil
-local mark_b_frame = nil
 local current_mode = "smartcut"
 
 local MODES = { "smartcut", "compress", "pansmash", "gif" }
-local MODE_LABELS = {
-    smartcut = "Mode: Smart Cut",
-    compress = "Mode: Compress",
-    pansmash = "Mode: Pan Smash",
-    gif      = "Mode: GIF",
-}
-local MODE_SHORT = {
-    smartcut = "Smart Cut",
-    compress = "Compress",
-    pansmash = "Pan Smash",
-    gif      = "GIF",
-}
+local MODE_NAMES = { smartcut = "Smart Cut", compress = "Compress", pansmash = "Pan Smash", gif = "GIF" }
 
 local function toggle_mode()
     local idx = 1
@@ -124,7 +80,7 @@ local function toggle_mode()
         if m == current_mode then idx = i; break end
     end
     current_mode = MODES[(idx % #MODES) + 1]
-    mp.osd_message(MODE_LABELS[current_mode])
+    mp.osd_message("Mode: " .. MODE_NAMES[current_mode])
 end
 
 local function format_time(sec)
@@ -146,7 +102,6 @@ local function launch_detached(args, log_path, label)
     for _, a in ipairs(args) do
         parts[#parts + 1] = shell_quote(a)
     end
-    local home = os.getenv("HOME") or ""
     local cache_dir  = SCRIPT_DIR .. "../../cache/.pycache"
     local dyld_extra = "/opt/homebrew/lib:/usr/local/lib"
     if resolved_av_dylibs and resolved_av_dylibs ~= "" then
@@ -154,7 +109,7 @@ local function launch_detached(args, log_path, label)
     end
     local cmd = 'DYLD_LIBRARY_PATH="' .. dyld_extra .. ':${DYLD_LIBRARY_PATH}" '
              .. 'PYTHONPYCACHEPREFIX=' .. shell_quote(cache_dir) .. ' '
-             .. 'PATH="' .. home .. '/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" nohup '
+             .. 'PATH="' .. TOOL_PATH .. '" nohup '
                 .. table.concat(parts, " ")
                 .. " > " .. shell_quote(log_path) .. " 2>&1 &"
     os.execute(cmd)
@@ -162,6 +117,7 @@ local function launch_detached(args, log_path, label)
     -- Tail the log file for live console output while mpv is open.
     local pos = 0
     local stale_ticks = 0
+    local check_warned = false
     local timer
     timer = mp.add_periodic_timer(1.0, function()
         local f = io.open(log_path, "r")
@@ -176,8 +132,9 @@ local function launch_detached(args, log_path, label)
             for line in chunk:gmatch("[^\r\n]+") do
                 mp.msg.info("[smartcut] " .. line)
             end
+            if chunk:find("[check] WARN", 1, true) then check_warned = true end
             if chunk:find("SUCCESS") then
-                mp.osd_message(label .. " ✓ Done")
+                mp.osd_message(label .. (check_warned and " ✓ Done — check warnings, see console (`)" or " ✓ Done"))
                 timer:kill()
                 return
             end
@@ -208,77 +165,9 @@ local function sanitize_filename(s)
     return s
 end
 
--- When mpv plays a disc via bd://, bluray://, dvd:// or dvdnav://, the actual
--- BDMV/VIDEO_TS folder is often NOT part of `path` at all - mpv keeps it in a
--- separate option (--bluray-device / --dvd-device) and `path` can come back
--- as bare as "bluray://" with nothing after it. Recover the real folder: try
--- an embedded path in the URL first (bd://TITLE/PATH), then fall back to the
--- matching device option. Returns nil if `input` isn't a disc protocol URL.
-local function resolve_disc_device_path(input)
-    local proto, rest = input:match("^(%a[%w+.-]*)://(.*)$")
-    if not proto then return nil end
-    proto = proto:lower()
-    if proto ~= "bd" and proto ~= "bluray" and proto ~= "dvd" and proto ~= "dvdnav" then
-        return nil
-    end
-
-    -- bd://TITLE/PATH or bd:///PATH - path embedded directly after an
-    -- optional title number.
-    local embedded = rest:match("^%d*/*(/.+)$")
-    if embedded and embedded ~= "" then
-        return embedded
-    end
-
-    local device_prop = (proto == "dvd" or proto == "dvdnav") and "dvd-device" or "bluray-device"
-    local device = mp.get_property(device_prop)
-    if device and device ~= "" then
-        return device
-    end
-
-    return nil
-end
-
--- BD/DVD sources break the plain "filename minus extension" logic in two ways:
---   1. A physical/protocol source (bd://, dvd://, bluray://) has no real
---      filename at all - `path` is just a protocol URL, and the actual folder
---      lives in a separate mpv option (see resolve_disc_device_path above).
---   2. A ripped disc folder's stream files are meaningless numbers
---      (BDMV/STREAM/00001.m2ts) or VOB titles (VIDEO_TS/VTS_01_1.VOB), not
---      the movie/show name.
--- In both cases, prefer mpv's `media-title` (which mpv resolves from the
--- disc's own playlist/IFO metadata), then fall back to the parent folder
--- name (the one actually named after the movie, one level above BDMV/VIDEO_TS).
 local function derive_name(input)
-    local media_title = mp.get_property("media-title")
-    local disc_path = resolve_disc_device_path(input)
-
-    if disc_path then
-        if media_title and media_title ~= "" then
-            return sanitize_filename(media_title)
-        end
-        -- No media-title available - fall back to the disc folder's own name.
-        local _, folder_name = utils.split_path(disc_path:gsub("[/\\]+$", ""))
-        return sanitize_filename((folder_name and folder_name ~= "") and folder_name or "disc")
-    end
-
-    local dir, filename = utils.split_path(input)
+    local _, filename = utils.split_path(input)
     local base = filename:match("^(.+)%.[^%.]+") or filename
-
-    local looks_numeric_or_vts = base:match("^%d+$") ~= nil or base:match("^VTS_%d+_%d+$") ~= nil
-    if looks_numeric_or_vts then
-        if media_title and media_title ~= "" then
-            return sanitize_filename(media_title)
-        end
-        -- .../MOVIE_NAME/BDMV/STREAM/00001.m2ts -> MOVIE_NAME
-        -- .../MOVIE_NAME/VIDEO_TS/VTS_01_1.VOB  -> MOVIE_NAME
-        -- (search the whole path, not just the immediate dir, since the
-        -- stream file sits under BDMV/STREAM or BDMV/PLAYLIST, not BDMV itself)
-        local parent = input:match("([^/\\]+)[/\\]BDMV[/\\]") or input:match("([^/\\]+)[/\\]VIDEO_TS[/\\]")
-        if parent then
-            return sanitize_filename(parent)
-        end
-    end
-
     return sanitize_filename(base)
 end
 
@@ -312,7 +201,6 @@ local function handle_cut_cycle()
     local sf, ef = mark_a_frame, current_frame()
     mark_a = nil
     mark_a_frame = nil
-    mark_b_frame = nil
 
     if start_t >= end_t then
         mp.osd_message("Error: Mark A must precede Mark B.")
@@ -321,10 +209,6 @@ local function handle_cut_cycle()
 
     local input = mp.get_property("path")
     local name = derive_name(input)
-    -- For disc protocol sources, hand smartcut.py the real folder (which its
-    -- own resolve_disc_input() can then dig into for the main .m2ts/VOB),
-    -- not the bare protocol string ffprobe can't do anything with.
-    local source_path = resolve_disc_device_path(input) or input
 
     local home = os.getenv("HOME") or ""
     local is_image_mode = (current_mode == "gif" or current_mode == "pansmash")
@@ -348,16 +232,15 @@ local function handle_cut_cycle()
     os.execute("mkdir -p " .. shell_quote(out_dir))
 
 
-    local label = MODE_SHORT[current_mode]
+    local label = MODE_NAMES[current_mode]
     mp.osd_message(label .. " started")
-    mp.msg.info("[smartcut] === " .. MODE_LABELS[current_mode] .. " → " .. out_file .. "===")
+    mp.msg.info("[smartcut] === Mode: " .. label .. " → " .. out_file .. "===")
 
     -- Pass exact timestamps (start_t, end_t) with millisecond accuracy.
     -- Also pass frame numbers when available: smartcut.py prefers --frames mode
-    -- (unambiguous integer indices) over floating-point timestamp snapping,
-    -- which is especially important on disc sources with PTS offsets.
+    -- (unambiguous integer indices) over floating-point timestamp snapping.
     local python_bin = detect_python()
-    local py_args = { python_bin, "-u", SMARTCUT_PY, source_path, tostring(start_t), tostring(end_t), out_file }
+    local py_args = { python_bin, "-u", SMARTCUT_PY, input, tostring(start_t), tostring(end_t), out_file }
     if sf and ef and sf >= 0 and ef > sf then
         py_args[#py_args + 1] = "--start-frame"
         py_args[#py_args + 1] = tostring(sf)

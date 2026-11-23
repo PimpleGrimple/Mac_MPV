@@ -25,10 +25,12 @@
   Key:     Ctrl+R opens/closes the menu, Ctrl+Alt+r exports straight away
            (registered by this script; also reachable as `script-binding
            remux/toggle` and `script-binding remux/export`)
-  Options: script-opts/remux.conf
+  Options: script-opts/remux.conf  (or `remux-<option>` script-opts)
            output_dir (empty = next to the source file), ffmpeg,
            ffprobe, container, convert_text_subs, apply_timing
-           (look: width, anchor, plus your shared menu-* opts, see style.lua)
+           look: width, anchor, margin, font, radius, pill_radius, outline, colours...
+           (the list and defaults are in style.lua; style profiles set them live
+           through remux-<option> script-opts)
   Needs:   mpv >= 0.39 (mp.input), ffmpeg + ffprobe
 ]]
 
@@ -38,9 +40,32 @@ local options = require "mp.options"
 local msg     = require "mp.msg"
 local has_input, input = pcall(require, "mp.input")
 
--- All remux options are read here, in one place. style.lua receives
--- its card look from this table (style.configure below) and reads no confs.
--- The keys are registered by this script (see the key bindings at the bottom).
+-- The look lives in style.lua next to this file, loaded first because it owns the
+-- defaults of the look options.
+local style, style_err
+do
+    local dir = mp.get_script_directory()
+    if not dir then
+        style_err = "install as a folder: scripts/remux/main.lua + style.lua"
+    else
+        local fn, err = loadfile(utils.join_path(dir, "style.lua"))
+        if not fn then
+            style_err = "style.lua: " .. tostring(err)
+        else
+            local ok, mod = pcall(fn)
+            if ok and type(mod) == "table" then
+                style = mod
+            else
+                style_err = "style.lua: " .. tostring(mod)
+            end
+        end
+    end
+    if style_err then msg.error(style_err) end
+end
+
+-- All remux options are read here, in one place, from script-opts/remux.conf and
+-- `remux-<option>` script-opts. The look options (defaults from style.lua) are handed
+-- to style.configure, now and whenever a style profile changes them.
 local o = {
     output_dir = "",   -- where exports go; empty = next to the source file
     ffmpeg = "",
@@ -48,53 +73,17 @@ local o = {
     container = "mkv",
     convert_text_subs = false,
     apply_timing = true,
-    -- card look (consumed by style.lua)
-    width = 680,
-    anchor = "",       -- empty = use the shared menu anchor
-    bg_alpha = "14",   -- hex 00-FF: 00 solid, FF invisible
 }
-options.read_options(o, "remux")
-
--- Shared menu look (script-opts/menu.conf + menu-* script-opts). Read here for
--- style.lua, which stays a pure renderer. Only the keys the card uses are
--- touched; the rest of menu.conf belongs to menu_style.lua.
-local menu_look = {
-    accent_color = "9b5de5", bg_color = "111111",
-    border_color = "d4baff", border_alpha = "78",
-    text_color = "f2f2f2", desc_color = "9a9a9a",
-    text_border_color = "111111",
-    font = "", blur = 12, anchor = "top-right", margin = 30,
-}
-do
-    local function set(key, value)
-        local default = menu_look[key]
-        if default == nil then return end
-        if type(default) == "number" then
-            menu_look[key] = tonumber(value) or default
-        else
-            menu_look[key] = value
-        end
-    end
-
-    local path = mp.command_native({ "expand-path", "~~/script-opts/menu.conf" })
-    local f = path and io.open(path, "r")
-    if f then
-        for line in f:lines() do
-            line = line:gsub("\r$", "")
-            if line:sub(1, 1) ~= "#" then
-                local key, value = line:match("^([%w_%-]+)%s*=(.*)$")
-                if key then set(key, value) end
-            end
-        end
-        f:close()
-    end
-
-    -- style profiles add these at runtime; they override menu.conf.
-    for key, value in pairs(mp.get_property_native("options/script-opts") or {}) do
-        local name = key:match("^menu%-(.+)$")
-        if name then set(name, tostring(value)) end
-    end
+if style and style.defaults then
+    for key, value in pairs(style.defaults) do o[key] = value end
 end
+
+local function apply_look()
+    if style and style.configure then style.configure(o) end
+end
+
+options.read_options(o, "remux", apply_look)
+apply_look()
 
 ---------------------------------------------------------------------------
 -- Static tables
@@ -600,32 +589,6 @@ local function build(bare)
     a[#a + 1] = "-f"; a[#a + 1] = c.fmt
     a[#a + 1] = (out_path())
     return a
-end
-
----------------------------------------------------------------------------
--- Style (the look lives in style.lua next to this file)
----------------------------------------------------------------------------
-
-local style, style_err
-do
-    local dir = mp.get_script_directory()
-    if not dir then
-        style_err = "install as a folder: scripts/remux/main.lua + style.lua"
-    else
-        local fn, err = loadfile(utils.join_path(dir, "style.lua"))
-        if not fn then
-            style_err = "style.lua: " .. tostring(err)
-        else
-            local ok, mod = pcall(fn)
-            if ok and type(mod) == "table" then
-                style = mod
-                if style.configure then style.configure(menu_look, o) end
-            else
-                style_err = "style.lua: " .. tostring(mod)
-            end
-        end
-    end
-    if style_err then msg.error(style_err) end
 end
 
 local ovc = mp.create_osd_overlay("ass-events") -- progress card

@@ -48,29 +48,34 @@ if _sc_bin and _os.path.isfile(_sc_bin):
                 _sys.path.append(_sp)  # append — our bundled copy takes priority
                 break
 
-import argparse, glob, os, re, sys, shutil, tempfile, struct, subprocess, json, time, traceback
+from bisect import bisect_left
+import argparse, glob, os, sys, shutil, tempfile, struct, subprocess, json, time, traceback
 import numpy as np
 from PIL import Image
 
 _SC_API_AVAILABLE = False
 _sc_import_err: Exception | None = None
+from fractions import Fraction as _SCFrac
+_EPSILON = _SCFrac(1, 1_000_000)  # < one frame, > float noise: pushes a cut end just past a frame's exact PTS
+
 try:
-    from fractions import Fraction as _SCFrac
     from smartcut.cut_video import (smart_cut as _sc_api, VideoSettings as _SCVideoSettings,
                                     AudioExportInfo as _SCAudioExportInfo,
-                                    AudioExportSettings as _SCAudioExportSettings)
-    from smartcut.media_utils import VideoExportMode as _SCMode, VideoExportQuality as _SCQuality
+                                    AudioExportSettings as _SCAudioExportSettings,
+                                    VideoCutter as _SCVideoCutter,
+                                    # Take the enums from cut_video, not media_utils: smartcut_lib
+                                    # ends up with two copies of media_utils, and enum members from
+                                    # the other copy are not recognised by the lib (it then silently
+                                    # falls back to CRF 18).
+                                    VideoExportMode as _SCMode, VideoExportQuality as _SCQuality)
     from smartcut.media_container import MediaContainer as _SCMediaContainer
     _SC_API_AVAILABLE = True
 except Exception as _e:
     _sc_import_err = _e
 
-# ============================== USER CONFIG ==============================
-# Everything you're likely to want to tweak lives here.
-
-
-def _find_bin(name):
-    """Find a binary on PATH, falling back to common macOS/Homebrew locations."""
+def _find_bin(name, required=True):
+    """Find a binary on PATH, falling back to common macOS/Homebrew locations.
+    Returns None instead of raising when required=False."""
     path = shutil.which(name)
     if path:
         return path
@@ -78,6 +83,8 @@ def _find_bin(name):
         candidate = prefix + name
         if os.path.isfile(candidate):
             return candidate
+    if not required:
+        return None
     raise RuntimeError(
         f"Could not find '{name}' on PATH or in common locations. "
         f"Install it or add its directory to PATH."
@@ -86,15 +93,44 @@ def _find_bin(name):
 
 FFMPEG_BIN = _find_bin("ffmpeg")
 FFPROBE_BIN = _find_bin("ffprobe")
+MKVPROPEDIT_BIN = _find_bin("mkvpropedit", required=False)  # optional: brew install mkvtoolnix
 
-# --- Smart Cut (GOP-boundary re-encode of the trimmed slivers, .cut.mkv) ---
-SMARTCUT_CRF = 10
-SMARTCUT_PRESET = "slower"          # x264/x265/vp9 preset string; ignored for AV1
-SMARTCUT_PRESET_AV1 = 4             # libsvtav1 wants an integer 0-13 (lower = slower/better)
+# ============================== USER CONFIG ==============================
+# Defaults. Any of these can be overridden in
+#   ~/.config/mpv/script-opts/smartcut.conf
+# (same names, lower-case, e.g. `gif_fps=15`) - see _load_conf() below.
+# Values set in the .conf always win; these are the fallbacks.
+
+# --- Smart Cut: how mpv's A/B marks become cut points ---
+# "frames"    : use mpv's frame numbers (estimated-frame-number). If a frame
+#               number lands more than FRAME_CHECK_TOLERANCE frames away from
+#               mpv's own timestamp for that mark, it is ignored and the
+#               timestamp is used instead (a warning is logged).
+# "timestamp" : always use mpv's time-pos timestamps, snapped to the nearest
+#               real frame. Never looks at frame numbers.
+CUT_MARKS = "frames"
+FRAME_CHECK_TOLERANCE = 1           # max allowed frame-number vs timestamp disagreement, in frames
+# Timestamp mode only: frames added after the frame found at mark B's timestamp.
+# mpv's time-pos reads behind the frame on screen, so 1 is the usual value.
+# 0 = cut ends on the frame at the timestamp itself; use it if cuts end 1 frame late.
+# Frame-number mode never adds any.
+END_FRAME_OFFSET = 1
+
+# --- After each Smart Cut ---
+SELF_CHECK = True                   # verify the result: keyframe start, frame count, audio/video alignment
+STRIP_STALE_TAGS = True             # remove the source file's leftover duration/frame-count/bitrate tags (needs mkvpropedit)
+
+# --- Smart Cut: encoder for the re-encoded parts (the GOP-edge slivers, and the
+# whole range when a cut sits inside a single GOP). Everything else is stream-copied.
+# None = keep smartcut_lib's built-in "normal" setting: CRF 18 (22 for HEVC/AV1/VP9),
+# x264/x265 at the encoder's default preset (medium), SVT-AV1 at preset 7.
+SMARTCUT_CRF = None                 # 0-63, lower = better/bigger; applied as-is for every codec
+SMARTCUT_PRESET = None              # x264/x265 preset name, ultrafast ... placebo
+SMARTCUT_PRESET_AV1 = None          # AV1 preset: SVT-AV1 0-13 (lower = slower/better), libaom cpu-used 0-8
 
 # --- Compress (plain full re-encode of the marked range, .compressed.mkv) ---
 # Unlike Smart Cut (which stream-copies most of the range and only
-# re-encodes the sliver-thin GOP edges at a near-lossless CRF), Compress
+# re-encodes only the sliver-thin GOP edges), Compress
 # re-encodes the whole marked range at a normal delivery CRF/preset - much
 # smaller output, same frame-accurate A/B cut, just not archival quality.
 COMPRESS_CRF = 10
@@ -146,12 +182,88 @@ GIF_LOOP = 0                     # 0 = loop forever, -1 = no loop, N = loop N ti
 # ever comes out looking pale again, flip this on and compare.
 GIF_LEVELS_STRETCH = False
 
-EPSILON = 1e-3
 # ===========================================================================
+
+EPSILON = 1e-3  # internal tolerance (seconds), not a user option
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+# ── Overrides from smartcut.conf ─────────────────────────────────────────────
+_CONF_PATH = os.path.expanduser("~/.config/mpv/script-opts/smartcut.conf")
+_CONF_OPTIONS = (
+    "CUT_MARKS", "FRAME_CHECK_TOLERANCE", "END_FRAME_OFFSET", "SELF_CHECK", "STRIP_STALE_TAGS",
+    "SMARTCUT_CRF", "SMARTCUT_PRESET", "SMARTCUT_PRESET_AV1",
+    "COMPRESS_CRF", "COMPRESS_PRESET", "COMPRESS_PRESET_AV1", "COMPRESS_ENCODER",
+    "EDGE_TRIM", "PAN_MINOR_PX", "PAN_STEP_PX", "PNG_COMPRESS_LEVEL",
+    "GIF_FPS", "GIF_MAX_WIDTH", "GIF_COLORS", "GIF_DITHER", "GIF_LOOP",
+    "GIF_LEVELS_STRETCH",
+)
+_CONF_NONE_OK = ("COMPRESS_ENCODER", "SMARTCUT_CRF", "SMARTCUT_PRESET", "SMARTCUT_PRESET_AV1")
+                                                      # these accept "auto"/"none" -> None (keep the default)
+_CONF_TYPES = {"SMARTCUT_CRF": int, "SMARTCUT_PRESET": str, "SMARTCUT_PRESET_AV1": int}  # defaults are None
+_CONF_RANGES = {"SMARTCUT_CRF": (0, 63), "SMARTCUT_PRESET_AV1": (0, 13), "END_FRAME_OFFSET": (0, 5)}
+_CONF_CHOICES = {
+    "CUT_MARKS": ("frames", "timestamp"),
+    "SMARTCUT_PRESET": ("ultrafast", "superfast", "veryfast", "faster", "fast",
+                        "medium", "slow", "slower", "veryslow", "placebo"),
+}
+
+
+def _load_conf():
+    """Apply `key=value` lines from smartcut.conf over the defaults above.
+    Whole-line `#` comments only. Bad keys/values are logged and ignored."""
+    try:
+        with open(_CONF_PATH, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return  # no conf file: defaults apply
+    g = globals()
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        key, raw = key.strip(), raw.strip()
+        name = key.upper()
+        if name not in _CONF_OPTIONS:
+            log(f"  [warn] smartcut.conf line {n}: unknown option '{key}' ignored")
+            continue
+        default = g[name]
+        try:
+            if name in _CONF_NONE_OK and raw.lower() in ("none", "auto"):
+                value = None
+            elif name in _CONF_TYPES:
+                value = _CONF_TYPES[name](raw)
+            elif isinstance(default, bool):
+                if raw.lower() in ("yes", "true", "on", "1"):
+                    value = True
+                elif raw.lower() in ("no", "false", "off", "0"):
+                    value = False
+                else:
+                    raise ValueError
+            elif isinstance(default, int):
+                value = int(raw)
+            elif isinstance(default, float):
+                value = float(raw)
+            else:
+                value = raw
+            if isinstance(value, str) and name in _CONF_CHOICES:
+                value = value.lower()
+                if value not in _CONF_CHOICES[name]:
+                    raise ValueError
+            if value is not None and name in _CONF_RANGES and not _CONF_RANGES[name][0] <= value <= _CONF_RANGES[name][1]:
+                raise ValueError
+        except ValueError:
+            log(f"  [warn] smartcut.conf line {n}: invalid value '{raw}' for '{key}' "
+                f"(keeping {default!r})")
+            continue
+        g[name] = value
+
+
+_load_conf()
 
 
 def run(cmd, **kw):
@@ -204,85 +316,6 @@ def ffprobe_json(args):
     r = run([FFPROBE_BIN, "-v", "error", "-of", "json"] + args)
     if r.returncode != 0: raise RuntimeError(f"ffprobe failed: {r.stderr.strip()}")
     return json.loads(r.stdout or "{}")
-
-
-# When mpv opens a folder containing BDMV (or VIDEO_TS) directly, it plays
-# the disc via its own libbluray/dvdnav demuxer, but the `path` property
-# mpv reports stays as the folder you opened - not any internal stream file.
-# ffprobe/ffmpeg can't do anything with a bare directory ("Is a directory"),
-# so resolve it down to something they can actually read before it's used
-# anywhere else.
-def resolve_disc_input(path):
-    """Resolve a BD/DVD folder to a real ffprobe/ffmpeg-readable input path.
-
-    - BD: largest .m2ts under BDMV/STREAM (the main feature clip). Accepts
-      either the folder that *contains* BDMV, or the BDMV folder itself.
-    - DVD: an ffmpeg concat:// of every VTS_NN_#.VOB part belonging to the
-      title set with the largest total size (menu-only VTS_NN_0.VOB is
-      skipped). Accepts either the folder that contains VIDEO_TS, or the
-      VIDEO_TS folder itself.
-
-    Returns `path` unchanged if it isn't a directory at all.
-
-    Note: this picks the single largest main-feature clip/title by size.
-    That's correct for the common case (one continuous main title), but
-    won't reconstruct a title assembled from multiple non-contiguous BD
-    playlist clips (e.g. seamless-branching menus) - rare for straight
-    anime/movie rips, but worth knowing about if a cut ever comes out short.
-    """
-    if not os.path.isdir(path):
-        return path
-
-    root = path.rstrip("/\\")
-
-    bdmv_dir = os.path.join(root, "BDMV")
-    if not os.path.isdir(bdmv_dir) and os.path.basename(root).upper() == "BDMV":
-        bdmv_dir = root
-    if os.path.isdir(bdmv_dir):
-        stream_dir = os.path.join(bdmv_dir, "STREAM")
-        if not os.path.isdir(stream_dir):
-            raise RuntimeError(f"Found a BDMV folder but no STREAM directory inside it: {stream_dir}")
-        m2ts_files = [f for f in glob.glob(os.path.join(stream_dir, "*")) if f.lower().endswith(".m2ts")]
-        if not m2ts_files:
-            raise RuntimeError(f"No .m2ts files found in {stream_dir}")
-        main = max(m2ts_files, key=os.path.getsize)
-        log(f"  [info] BD folder detected - using main feature stream: {os.path.relpath(main, root)}")
-        return main
-
-    video_ts_dir = os.path.join(root, "VIDEO_TS")
-    if not os.path.isdir(video_ts_dir) and os.path.basename(root).upper() == "VIDEO_TS":
-        video_ts_dir = root
-    if os.path.isdir(video_ts_dir):
-        vobs = [f for f in glob.glob(os.path.join(video_ts_dir, "*")) if f.lower().endswith(".vob")]
-        if not vobs:
-            raise RuntimeError(f"No .VOB files found in {video_ts_dir}")
-
-        by_title = {}
-        for v in vobs:
-            m = re.match(r"VTS_(\d+)_(\d+)\.VOB$", os.path.basename(v), re.IGNORECASE)
-            if not m:
-                continue  # ignore VIDEO_TS.VOB (top menu) and anything unexpected
-            title_num, part_num = int(m.group(1)), int(m.group(2))
-            if part_num == 0:
-                continue  # per-title menu part, not feature content
-            by_title.setdefault(title_num, []).append(v)
-        if not by_title:
-            raise RuntimeError(f"No title-content VOBs (VTS_nn_1..9) found in {video_ts_dir}")
-
-        main_title = max(by_title, key=lambda t: sum(os.path.getsize(v) for v in by_title[t]))
-        parts = sorted(
-            by_title[main_title],
-            key=lambda v: int(re.match(r"VTS_\d+_(\d+)\.VOB$", os.path.basename(v), re.IGNORECASE).group(1)),
-        )
-        log(f"  [info] DVD folder detected - using title {main_title:02d} "
-            f"({len(parts)} part{'s' if len(parts) != 1 else ''}): "
-            + ", ".join(os.path.basename(p) for p in parts))
-        return parts[0] if len(parts) == 1 else "concat:" + "|".join(parts)
-
-    raise RuntimeError(
-        f"'{path}' is a directory but doesn't look like a BD (BDMV/STREAM) "
-        f"or DVD (VIDEO_TS) folder structure."
-    )
 
 
 def probe_streams(input_path):
@@ -363,7 +396,7 @@ def resolve_pix_fmt(video, encoder):
     return fmt
 
 
-def encode_video_args(video, crf, preset, av1_preset=SMARTCUT_PRESET_AV1, force_encoder=None):
+def encode_video_args(video, crf, preset, av1_preset=COMPRESS_PRESET_AV1, force_encoder=None):
     codec = video.get("codec_name")
     encoder = force_encoder or {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1", "vp9": "libvpx-vp9",
                                  "mpeg2video": "mpeg2video", "mpeg4": "mpeg4"}.get(codec)
@@ -481,7 +514,7 @@ def count_frames_between(input_path, t_from, t_to, video_index, offset=0.0, marg
 
 
 
-def make_segment_reencode(input_path, seek, t_start, t_end, video, audios, crf, preset, out_path, offset=0.0, av1_preset=SMARTCUT_PRESET_AV1, force_encoder=None, subtitles=None):
+def make_segment_reencode(input_path, seek, t_start, t_end, video, audios, crf, preset, out_path, offset=0.0, av1_preset=COMPRESS_PRESET_AV1, force_encoder=None, subtitles=None):
     """Re-encode a segment. Used by compress_cut for full-range re-encoding, and smart_cut for GOP edge slivers.
 
     `audios` is a list of audio-stream dicts (from probe_streams). Pass an empty list or None to suppress audio.
@@ -516,228 +549,6 @@ def make_segment_reencode(input_path, seek, t_start, t_end, video, audios, crf, 
     return True
 
 
-def make_segment_streamcopy(input_path, t_start, t_end, video, audios, out_path, offset=0.0, subtitles=None):
-    """Stream-copy a segment without re-encoding."""
-    dur = t_end - t_start
-    if dur <= 0:
-        return False
-    cmd = [FFMPEG_BIN, "-nostdin", "-y", "-loglevel", "error", "-stats",
-           "-fflags", "+genpts",
-           "-ss", f"{t_start + offset:.6f}", "-i", input_path,
-           "-t", f"{dur:.6f}",
-           "-map", f"0:{video['index']}", "-map_chapters", "-1",
-           "-c:v", "copy"]
-    if audios:
-        for audio in audios:
-            cmd += ["-map", f"0:{audio['index']}?"] + audio_codec_args(audio)
-    else:
-        cmd += ["-an"]
-    if subtitles:
-        for s in subtitles:
-            cmd += ["-map", f"0:{s['index']}?", "-c:s", "copy"]
-    else:
-        cmd += ["-sn"]
-    cmd += ["-avoid_negative_ts", "make_zero", out_path]
-    rc, tail = run_live(cmd)
-    if rc != 0:
-        raise RuntimeError(f"Stream-copy failed:\n{tail}")
-    return True
-
-
-def ffmpeg_smart_cut(input_path, start, end, output_path,
-                     crf=SMARTCUT_CRF, preset=SMARTCUT_PRESET):
-    """Pure-ffmpeg GOP-boundary smart cut — no full file scan.
-
-    Uses ffprobe -read_intervals to probe keyframes only in a focused window
-    around each cut point, then splices segments:
-      - Single GOP           → pure re-encode of the short marked range.
-      - Both ends on keyframe → pure stream copy (fastest, lossless).
-      - Start mid-GOP        → re-encode head sliver + stream-copy rest.
-      - End mid-GOP          → stream-copy bulk + re-encode tail sliver.
-      - Both ends mid-GOP    → re-encode head + stream-copy middle + re-encode tail.
-    Segments are joined with ffmpeg concat demuxer. Never reads the full file.
-    """
-    if end <= start:
-        raise RuntimeError("end must be after start")
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
-    video, audios, subtitles = probe_streams(input_path)
-    offset = get_pts_offset(input_path, video["index"])
-    if abs(offset) > EPSILON:
-        log(f"  [info] PTS offset: {offset:.3f}s")
-
-    # Use a focused probe window (6s) around cut points to avoid crossing
-    # DVD cell / chapter boundaries where timestamp discontinuities break ffprobe.
-    PROBE_WINDOW = 6.0
-    kfs_start = get_keyframes(input_path, max(0.0, start - PROBE_WINDOW), start + PROBE_WINDOW,
-                              video["index"], offset)
-    if not any(k <= start + EPSILON for k in kfs_start) and start > PROBE_WINDOW:
-        kfs_start = get_keyframes(input_path, max(0.0, start - 20.0), start + PROBE_WINDOW,
-                                  video["index"], offset)
-
-    kfs_end = get_keyframes(input_path, max(0.0, end - PROBE_WINDOW), end + PROBE_WINDOW,
-                            video["index"], offset)
-    if not any(k <= end + EPSILON for k in kfs_end) and end > PROBE_WINDOW:
-        kfs_end = get_keyframes(input_path, max(0.0, end - 20.0), end + PROBE_WINDOW,
-                                video["index"], offset)
-
-    valid_start_kfs = [k for k in kfs_start if k <= start + EPSILON]
-    kf_before_start = max(valid_start_kfs, default=max(0.0, start - PROBE_WINDOW))
-    kf_at_or_after_start = next((k for k in sorted(kfs_start) if k >= start - EPSILON), None)
-
-    valid_end_kfs = [k for k in kfs_end if k <= end + EPSILON]
-    kf_at_or_before_end = max(valid_end_kfs, default=None)
-    kf_at_or_after_end = next((k for k in sorted(kfs_end) if k >= end - EPSILON), None)
-
-    start_on_kf = kf_at_or_after_start is not None and abs(kf_at_or_after_start - start) < EPSILON
-    end_on_kf = kf_at_or_before_end is not None and abs(kf_at_or_before_end - end) < EPSILON
-    single_gop = (kf_at_or_after_start is None or kf_at_or_after_start >= end - EPSILON or
-                  (kf_at_or_before_end is not None and kf_at_or_before_end <= start + EPSILON))
-
-    log(f"  [gop] kf_before_start={_format_ts(kf_before_start)}  "
-        f"kf_after_start={_format_ts(kf_at_or_after_start) if kf_at_or_after_start is not None else 'none'}  "
-        f"kf_before_end={_format_ts(kf_at_or_before_end) if kf_at_or_before_end is not None else 'none'}  "
-        f"start_on_kf={start_on_kf}  end_on_kf={end_on_kf}  single_gop={single_gop}")
-
-    tmpdir = tempfile.mkdtemp(prefix="ffsc_")
-    try:
-        if single_gop:
-            log("  [cut] Single GOP — full re-encode (short cut within one GOP)")
-            ok = make_segment_reencode(input_path, kf_before_start, start, end,
-                                       video, audios, crf, preset, output_path, offset,
-                                       subtitles=subtitles)
-            if not ok:
-                raise RuntimeError("Single-GOP encode produced no output.")
-            return
-
-        if start_on_kf and end_on_kf:
-            log("  [cut] Keyframe-aligned — pure stream copy")
-            ok = make_segment_streamcopy(input_path, start, end,
-                                         video, audios, output_path, offset,
-                                         subtitles=subtitles)
-            if not ok:
-                raise RuntimeError("Stream-copy produced no output.")
-            return
-
-        # Spliced cut (head/mid/tail):
-        # To avoid audio packet truncation and desync at GOP slice boundaries,
-        # produce VIDEO-ONLY slices for the splice, concatenate them, and
-        # mux with a single continuous audio pass across [start, end].
-        video_segments = []
-
-        if start_on_kf:
-            log("  [cut] Start on keyframe — copy bulk + re-encode tail")
-            if kf_at_or_before_end is not None and kf_at_or_before_end > start + EPSILON:
-                seg = os.path.join(tmpdir, "seg_copy.mkv")
-                make_segment_streamcopy(input_path, start, kf_at_or_before_end,
-                                        video, [], seg, offset)
-                video_segments.append(seg)
-            reencode_start = kf_at_or_before_end if kf_at_or_before_end is not None else start
-            if end > reencode_start + EPSILON:
-                seg = os.path.join(tmpdir, "seg_tail.mkv")
-                make_segment_reencode(input_path, reencode_start,
-                                      reencode_start, end, video, None,
-                                      crf, preset, seg, offset)
-                video_segments.append(seg)
-
-        elif end_on_kf:
-            log("  [cut] End on keyframe — re-encode head + copy bulk")
-            if kf_at_or_after_start is not None and kf_at_or_after_start > start + EPSILON:
-                seg = os.path.join(tmpdir, "seg_head.mkv")
-                make_segment_reencode(input_path, kf_before_start,
-                                      start, kf_at_or_after_start, video, None,
-                                      crf, preset, seg, offset)
-                video_segments.append(seg)
-            copy_start = kf_at_or_after_start if kf_at_or_after_start is not None else start
-            if end > copy_start + EPSILON:
-                seg = os.path.join(tmpdir, "seg_copy.mkv")
-                make_segment_streamcopy(input_path, copy_start, end,
-                                        video, [], seg, offset)
-                video_segments.append(seg)
-
-        else:
-            log("  [cut] Both ends mid-GOP — re-encode head + copy middle + re-encode tail")
-            if kf_at_or_after_start is not None and kf_at_or_after_start > start + EPSILON:
-                seg = os.path.join(tmpdir, "seg_head.mkv")
-                make_segment_reencode(input_path, kf_before_start,
-                                      start, kf_at_or_after_start, video, None,
-                                      crf, preset, seg, offset)
-                video_segments.append(seg)
-            if (kf_at_or_before_end is not None and kf_at_or_after_start is not None
-                    and kf_at_or_before_end > kf_at_or_after_start + EPSILON):
-                seg = os.path.join(tmpdir, "seg_mid.mkv")
-                make_segment_streamcopy(input_path, kf_at_or_after_start, kf_at_or_before_end,
-                                        video, [], seg, offset)
-                video_segments.append(seg)
-            reencode_start = kf_at_or_before_end if (kf_at_or_before_end is not None and kf_at_or_before_end >= (kf_at_or_after_start or 0.0)) else kf_at_or_after_start
-            if reencode_start is not None and end > reencode_start + EPSILON:
-                seg = os.path.join(tmpdir, "seg_tail.mkv")
-                make_segment_reencode(input_path, reencode_start,
-                                      reencode_start, end, video, None,
-                                      crf, preset, seg, offset)
-                video_segments.append(seg)
-
-        if not video_segments:
-            raise RuntimeError("No segments produced — check start/end times.")
-
-        # Join video segments
-        if len(video_segments) == 1:
-            joined_video = video_segments[0]
-        else:
-            joined_video = os.path.join(tmpdir, "joined_video.mkv")
-            concat_list = os.path.join(tmpdir, "concat.txt")
-            with open(concat_list, "w") as f:
-                for seg in video_segments:
-                    f.write(f"file '{seg}'\n")
-            rc, tail = run_live([FFMPEG_BIN, "-nostdin", "-y", "-loglevel", "error",
-                                 "-f", "concat", "-safe", "0", "-i", concat_list,
-                                 "-c", "copy", joined_video])
-            if rc != 0:
-                raise RuntimeError(f"Video concat failed:\n{tail}")
-
-        # If audio/subtitle tracks exist, extract continuous audio+subs from
-        # start to end and remux with the concatenated video.
-        if audios or subtitles:
-            dur = end - start
-            seg_audio = os.path.join(tmpdir, "audio_subs.mkv")
-            audio_cmd = [FFMPEG_BIN, "-nostdin", "-y", "-loglevel", "error", "-stats",
-                         "-fflags", "+genpts",
-                         "-ss", f"{start + offset:.6f}", "-i", input_path,
-                         "-t", f"{dur:.6f}", "-vn"]
-            if audios:
-                for a in audios:
-                    audio_cmd += ["-map", f"0:{a['index']}?"] + audio_codec_args(a)
-            else:
-                audio_cmd += ["-an"]
-            if subtitles:
-                for s in subtitles:
-                    audio_cmd += ["-map", f"0:{s['index']}?", "-c:s", "copy"]
-            else:
-                audio_cmd += ["-sn"]
-            audio_cmd += ["-avoid_negative_ts", "make_zero", seg_audio]
-            rc, tail = run_live(audio_cmd)
-            if rc != 0:
-                raise RuntimeError(f"Audio/subtitle extraction failed:\n{tail}")
-
-            # Final mux: combine concatenated video with continuous audio+subs
-            final_cmd = [FFMPEG_BIN, "-nostdin", "-y", "-loglevel", "error",
-                         "-i", joined_video, "-i", seg_audio,
-                         "-map", "0:v"]
-            if audios:
-                final_cmd += ["-map", "1:a?"]
-            if subtitles:
-                final_cmd += ["-map", "1:s?"]
-            final_cmd += ["-c", "copy", output_path]
-            rc, tail = run_live(final_cmd)
-            if rc != 0:
-                raise RuntimeError(f"Final mux failed:\n{tail}")
-        else:
-            shutil.move(joined_video, output_path)
-
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
 def _format_duration(secs):
     """Format seconds into a human-readable duration string."""
     if secs < 60:
@@ -768,34 +579,110 @@ def _format_ts(secs):
     return f"{m:02d}:{s:06.3f}"
 
 
-def smart_cut(input_path, start, end, output_path, audio_idx=0, window=8.0, max_window=120.0,
-              crf=SMARTCUT_CRF, preset=SMARTCUT_PRESET,
-              start_frame=None, end_frame=None):
-    """Frame-accurate smart cut using the smartcut library (PyAV-based).
+def verify_cut(path, expected_frames):
+    """Sanity-check a finished smart cut and log the result.
+    Problems are logged as '[check] WARN ...' (main.lua shows an OSD hint)."""
+    problems = []
+    try:
+        first = (ffprobe_json(["-select_streams", "v:0", "-read_intervals", "%+#1",
+                               "-show_entries", "packet=flags", path]).get("packets") or [{}])[0]
+        info = ffprobe_json(["-show_entries", "stream=index,codec_type,start_time,r_frame_rate:format=duration", path])
+        streams, dur = info["streams"], float(info["format"]["duration"])
+        v = next(s for s in streams if s["codec_type"] == "video")
+        tol = 2 * float(1 / _SCFrac(v["r_frame_rate"]))  # audio packets are coarser than frames
+        if "K" not in (first.get("flags") or ""):
+            problems.append("first video packet is not a keyframe (some players show a gray/black start)")
+        # (-count_packets reads the whole file; Matroska has no per-stream durations,
+        # so stream ends come from the packets in the last 2 seconds.)
+        n = int(ffprobe_json(["-select_streams", "v:0", "-count_packets", "-show_entries",
+                              "stream=nb_read_packets", path])["streams"][0]["nb_read_packets"])
+        if n != expected_frames:
+            problems.append(f"{n} video frames, expected {expected_frames}")
+        end = {}
+        for pk in ffprobe_json(["-read_intervals", f"{max(dur - 2, 0)}%", "-show_entries",
+                                "packet=stream_index,pts_time,duration_time", path]).get("packets", []):
+            end[pk["stream_index"]] = max(end.get(pk["stream_index"], 0.0),
+                                          float(pk["pts_time"]) + float(pk.get("duration_time") or 0))
+        offsets = []
+        for i, a in enumerate(s for s in streams if s["codec_type"] == "audio"):
+            d_start = float(a["start_time"]) - float(v["start_time"])
+            d_end = end[a["index"]] - end[v["index"]] if a["index"] in end and v["index"] in end else None
+            offsets.append((d_start, d_end))
+            if abs(d_start) > tol:
+                problems.append(f"audio track {i + 1} starts {d_start * 1000:+.0f} ms vs video")
+            if d_end is not None and abs(d_end) > tol:
+                problems.append(f"audio track {i + 1} ends {d_end * 1000:+.0f} ms vs video")
+    except Exception as e:
+        log(f"  [check] skipped ({e})")
+        return
+    if problems:
+        for msg in problems:
+            log(f"  [check] WARN {msg}")
+    else:
+        sync = ""
+        if offsets and offsets[0][1] is not None:
+            sync = f", audio/video aligned (start {offsets[0][0] * 1000:+.0f} ms, end {offsets[0][1] * 1000:+.0f} ms)"
+        log(f"  [check] OK  starts on a keyframe, {n} frames as expected{sync}")
 
-    Delegates to the `smartcut` CLI which uses PyAV for packet-level control,
-    giving perfect frame-accurate cuts with zero gaps, zero dupes, and zero
-    frame count errors — even at B-frame/P-frame boundaries.
+
+def strip_stale_tags(path):
+    """smartcut_lib copies the source's mkvmerge statistics tags (duration, frame
+    count, bitrate, size of the WHOLE movie) into the clip, where they are wrong.
+    mkvpropedit deletes them in place (header edit only; no remux, data untouched)."""
+    if not MKVPROPEDIT_BIN:
+        log("  [tags] stale source tags left in place (brew install mkvtoolnix to strip them)")
+        return
+    r = run([MKVPROPEDIT_BIN, path, "--delete-track-statistics-tags"])
+    if r.returncode in (0, 1):
+        log("  [tags] removed stale source statistics tags")
+    else:
+        log(f"  [tags] mkvpropedit failed (exit {r.returncode}); tags left in place")
+
+
+def _install_seam_encoder_overrides():
+    """Apply SMARTCUT_CRF / SMARTCUT_PRESET / SMARTCUT_PRESET_AV1 to the encoder
+    smartcut_lib uses for re-encoded video, which the lib hardcodes. Wraps
+    VideoCutter.init_encoder at runtime; smartcut_lib itself is not modified."""
+    if not _SC_API_AVAILABLE:
+        return
+    _orig_init_encoder = _SCVideoCutter.init_encoder
+
+    def init_encoder(self):
+        _orig_init_encoder(self)
+        opts, codec = self.encoding_options, self.codec_name or ""
+        if SMARTCUT_CRF is not None:
+            opts["crf"] = str(SMARTCUT_CRF)
+        if "svtav1" in codec:
+            if SMARTCUT_PRESET_AV1 is not None:
+                opts["preset"] = str(SMARTCUT_PRESET_AV1)
+        elif "aom" in codec:
+            if SMARTCUT_PRESET_AV1 is not None:
+                opts["cpu-used"] = str(SMARTCUT_PRESET_AV1)
+        elif codec in ("h264", "hevc") and SMARTCUT_PRESET is not None:
+            opts["preset"] = SMARTCUT_PRESET
+        log(f"  [encode] re-encoded parts: {codec} crf {opts['crf']}, "
+            f"preset {opts.get('preset', opts.get('cpu-used', 'encoder default'))}")
+
+    _SCVideoCutter.init_encoder = init_encoder
+
+
+_install_seam_encoder_overrides()
+
+
+def smart_cut(input_path, start, end, output_path, start_frame=None, end_frame=None):
+    """Frame-accurate smart cut using the bundled smartcut_lib (PyAV-based).
+
+    Only the GOP-edge slivers are re-encoded (CRF/preset: see SMARTCUT_CRF /
+    SMARTCUT_PRESET); everything between is stream-copied.
 
     start_frame / end_frame: 0-based frame indices from mpv's
-    estimated-frame-number. When provided, smartcut is invoked with --frames
-    for exact frame-level precision, bypassing all floating-point timestamp
-    snapping. Falls back to timestamp mode if not provided.
+    estimated-frame-number. Used only when CUT_MARKS = "frames" and they agree
+    with the timestamps; otherwise the timestamps are used.
     """
     if end <= start: raise RuntimeError("end must be after start")
+    if not _SC_API_AVAILABLE:
+        raise RuntimeError(f"bundled smartcut_lib failed to import: {_sc_import_err}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
-    # --- Find smartcut binary ---
-    smartcut_bin = shutil.which("smartcut")
-    if not smartcut_bin:
-        for candidate in [os.path.expanduser("~/.local/bin/smartcut")]:
-            if os.path.isfile(candidate):
-                smartcut_bin = candidate
-                break
-    if not smartcut_bin:
-        raise RuntimeError(
-            "Could not find 'smartcut' CLI. Install it with: pipx install smartcut"
-        )
 
     # --- Pre-cut diagnostics ---
     dur = end - start
@@ -828,7 +715,6 @@ def smart_cut(input_path, start, end, output_path, audio_idx=0, window=8.0, max_
             kf_at_start = any(abs(k - start) < EPSILON for k in kfs)
             kf_at_end = any(abs(k - end) < EPSILON for k in kfs)
             kf_after_start = next((k for k in sorted(kfs) if k >= start - EPSILON), None)
-            kf_before_end = next((k for k in sorted(kfs, reverse=True) if k <= end + EPSILON), None)
             single_gop = kf_after_start is None or kf_after_start >= end - EPSILON
 
             if single_gop:
@@ -859,114 +745,89 @@ def smart_cut(input_path, start, end, output_path, audio_idx=0, window=8.0, max_
             input_path, tmpdir, start, end, audios,
             start_frame=start_frame, end_frame=end_frame)
 
-        # Prefer --frames (exact integer frame index) over timestamps.
-        # Timestamps go through floating-point→string→searchsorted and can
-        # snap to the wrong frame by ±1. Frame numbers are unambiguous.
-        use_frames = (eff_sf is not None and eff_ef is not None
+        # CUT_MARKS = "frames": use mpv's frame numbers as the cut points
+        # (checked against the timestamps further down). "timestamp": ignore them.
+        use_frames = (CUT_MARKS == "frames"
+                      and eff_sf is not None and eff_ef is not None
                       and eff_sf >= 0 and eff_ef > eff_sf)
         if use_frames:
             log(f"  [frames] Using frame-number mode: {eff_sf} → {eff_ef}")
 
         t0 = time.monotonic()
 
-        # ISOs and DVD VOB concat paths require MediaContainer to demux the
-        # ENTIRE file into RAM to build its frame index — for an 8+ GB ISO this
-        # hangs indefinitely. Detect them and skip straight to the CLI fallback,
-        # which uses ffprobe seek-based keyframe lookup and doesn't full-scan.
-        _is_disc_input = (
-            effective_input.lower().endswith(".iso") or
-            effective_input.lower().endswith(".img") or
-            effective_input.startswith("concat:")
-        )
-
-        # Call the smartcut Python API directly instead of the CLI.
-        # The CLI hardcodes VideoExportQuality.NORMAL (CRF 18) for the
-        # re-encoded sliver frames at the seam. Using LOSSLESS (CRF 0)
-        # instead makes those 1-2 re-encoded frames visually indistinguishable
-        # from the surrounding stream-copied frames, eliminating the seam artefact.
-        if _SC_API_AVAILABLE and not _is_disc_input:
+        try:
+            _src = _SCMediaContainer(effective_input)
             try:
-                _src = _SCMediaContainer(effective_input)
-                try:
-                    # _EPSILON: smaller than one frame, larger than float noise.
-                    # Used to push the end time just past a frame's exact PTS so
-                    # smartcut's internal "exclude if exactly on boundary" logic
-                    # includes the last desired frame.
-                    _EPSILON = _SCFrac(1, 1_000_000)
-
-                    if use_frames:
-                        _cand_start = _src.video_frame_times[min(eff_sf, len(_src.video_frame_times)-1)] - _src.start_time
-                        _cand_end   = _src.video_frame_times[min(eff_ef, len(_src.video_frame_times)-1)] - _src.start_time
-                        # Safety check: if frame numbers disagree with timestamps by > 0.5s (e.g. from fps mismatch),
-                        # discard the frame numbers and trust the exact timestamps.
-                        if abs(float(_cand_start) - eff_start) > 0.5 or abs(float(_cand_end) - eff_end) > 0.5:
-                            log(f"  [warn] Frame indices ({eff_sf}→{eff_ef}) disagree with timestamps ({eff_start:.2f}→{eff_end:.2f}s). Using timestamps.")
-                            _t_start = _SCFrac(eff_start).limit_denominator(1_000_000)
-                            _t_end   = _SCFrac(eff_end).limit_denominator(1_000_000)
-                        else:
-                            _t_start = _cand_start
-                            _t_end   = _cand_end
-                    else:
+                _end_is_exact_frame = False  # True only when mpv's end frame number was accepted
+                if use_frames:
+                    _cand_start = _src.video_frame_times[min(eff_sf, len(_src.video_frame_times)-1)] - _src.start_time
+                    _cand_end   = _src.video_frame_times[min(eff_ef, len(_src.video_frame_times)-1)] - _src.start_time
+                    # Safety check: if a frame number is more than FRAME_CHECK_TOLERANCE
+                    # frames away from mpv's timestamp for that mark, discard the frame
+                    # numbers and trust the timestamps.
+                    _ft = _src.video_frame_times
+                    def _gap(i):  # duration of the frame at index i (seconds)
+                        i = max(0, min(i, len(_ft) - 2))
+                        return float(_ft[i + 1] - _ft[i])
+                    _tol_s = max(_gap(eff_sf), _gap(eff_ef)) * FRAME_CHECK_TOLERANCE
+                    if abs(float(_cand_start) - eff_start) > _tol_s + 1e-6 or abs(float(_cand_end) - eff_end) > _tol_s + 1e-6:
+                        log(f"  [warn] Frame indices ({eff_sf}→{eff_ef}) disagree with timestamps ({eff_start:.3f}→{eff_end:.3f}s) by more than {FRAME_CHECK_TOLERANCE} frame. Using timestamps.")
                         _t_start = _SCFrac(eff_start).limit_denominator(1_000_000)
                         _t_end   = _SCFrac(eff_end).limit_denominator(1_000_000)
+                    else:
+                        _t_start = _cand_start
+                        _t_end   = _cand_end
+                        _end_is_exact_frame = True
+                else:
+                    _t_start = _SCFrac(eff_start).limit_denominator(1_000_000)
+                    _t_end   = _SCFrac(eff_end).limit_denominator(1_000_000)
 
-                    # START: Frame-accurate cut. Snap to the exact frame at or after mark A.
-                    # If mark A is on a keyframe, smartcut remuxes with 0 re-encoding.
-                    # If mark A is mid-GOP, smartcut re-encodes only the tiny head seam at
-                    # NEAR_LOSSLESS quality without dropping any user-selected content.
-                    _snap_start = _src.get_frame_time_at_or_after(_t_start)
+                # START: Frame-accurate cut. Snap to the exact frame at or after mark A.
+                # If mark A is on a keyframe, smartcut remuxes with 0 re-encoding.
+                # If mark A is mid-GOP, smartcut re-encodes only the tiny head seam at
+                # the configured quality without dropping any user-selected content.
+                _snap_start = _src.get_frame_time_at_or_after(_t_start)
 
-                    # END: mpv's time-pos (and estimated-vpts) lags ~2 frames behind
-                    # the frame actually displayed on screen. A single at_or_after call
-                    # advances 1 frame past time-pos (still 1 frame early). A second
-                    # at_or_after call advances to the frame the user was looking at.
-                    _frame_at_end = _src.get_frame_time_at_or_after(_t_end)
-                    _snap_end = _src.get_frame_time_at_or_after(
-                        _frame_at_end + _SCFrac(1, 1000)
-                    ) + _EPSILON
+                # END, frame-number mode: _t_end IS the exact frame the user marked, so
+                # the cut ends right after it. No compensation.
+                # END, timestamp mode: mpv's time-pos (and estimated-vpts) lags behind the
+                # frame actually displayed on screen, so END_FRAME_OFFSET frames (default 1)
+                # are added after the frame found at the timestamp.
+                _last_frame = _src.get_frame_time_at_or_after(_t_end)
+                if not _end_is_exact_frame:
+                    for _ in range(END_FRAME_OFFSET):
+                        _last_frame = _src.get_frame_time_at_or_after(_last_frame + _SCFrac(1, 1000))
+                _snap_end = _last_frame + _EPSILON
 
-                    _head_ms = float(_snap_start - _t_start) * 1000
-                    _tail_ms = float(_snap_end - _EPSILON - _t_end) * 1000
-                    log(f"  [snap] start {float(_t_start):.4f}→{float(_snap_start):.4f}s "
-                        f"({_head_ms:+.1f}ms)  "
-                        f"end {float(_t_end):.4f}→{float(_snap_end - _EPSILON):.4f}s "
-                        f"({_tail_ms:+.1f}ms)")
+                _head_ms = float(_snap_start - _t_start) * 1000
+                _tail_ms = float(_snap_end - _EPSILON - _t_end) * 1000
+                log(f"  [snap] start {float(_t_start):.4f}→{float(_snap_start):.4f}s "
+                    f"({_head_ms:+.1f}ms)  "
+                    f"end {float(_t_end):.4f}→{float(_snap_end - _EPSILON):.4f}s "
+                    f"({_tail_ms:+.1f}ms)")
 
-                    _segs = [(_snap_start, _snap_end)]
+                _segs = [(_snap_start, _snap_end)]
+                # Frames the output should contain: those with start <= pts < end.
+                _expected_frames = (bisect_left(_src.video_frame_times, _snap_end)
+                                    - bisect_left(_src.video_frame_times, _snap_start))
 
 
-                    _audio_settings = [_SCAudioExportSettings(codec='passthru')] * len(_src.audio_tracks)
-                    _export_info = _SCAudioExportInfo(output_tracks=_audio_settings)
-                    # NEAR_LOSSLESS = CRF 3: visually indistinguishable from lossless and
-                    # compatible with H.264 High profile (LOSSLESS = CRF 0 is not).
-                    # Massive improvement over CLI default of CRF 18 for the seam frames.
-                    _vid_settings = _SCVideoSettings(_SCMode.SMARTCUT, _SCQuality.NEAR_LOSSLESS, 'copy')
-                    _exc = _sc_api(_src, _segs, output_path,
-                                   audio_export_info=_export_info,
-                                   video_settings=_vid_settings)
-                finally:
-                    _src.close()
-                if _exc is not None:
-                    raise _exc
-            except Exception as _api_err:
-                raise RuntimeError(f"smartcut API failed: {_api_err}") from _api_err
-        else:
-            # Disc inputs (ISO/VOB concat) use pure-ffmpeg smart cut — no full-disc scan.
-            # Library unavailability also lands here (falls back to CLI).
-            if _is_disc_input:
-                log(f"  [info] Disc input — using ffmpeg smart cut (no full-disc scan)")
-                ffmpeg_smart_cut(effective_input, eff_start, eff_end, output_path,
-                                 crf=SMARTCUT_CRF, preset=SMARTCUT_PRESET)
-            else:
-                log(f"  [warn] smartcut Python API unavailable ({_sc_import_err}), using CLI fallback")
-                keep_arg = f"{eff_sf},{eff_ef}" if use_frames else f"{eff_start},{eff_end}"
-                sc_cmd = [smartcut_bin, effective_input, output_path,
-                          "--keep", keep_arg, "--log-level", "warning"]
-                if use_frames:
-                    sc_cmd.append("--frames")
-                rc, tail = run_live(sc_cmd)
-                if rc != 0:
-                    raise RuntimeError(f"smartcut CLI failed (exit {rc}):\n{tail}")
+                _audio_settings = [_SCAudioExportSettings(codec='passthru')] * len(_src.audio_tracks)
+                _export_info = _SCAudioExportInfo(output_tracks=_audio_settings)
+                # NORMAL = the lib's CRF 18 (22 for HEVC/AV1/VP9) - what this script has
+                # always actually produced. SMARTCUT_CRF / SMARTCUT_PRESET override it
+                # (see _install_seam_encoder_overrides). Avoid LOSSLESS (CRF 0): it is
+                # not compatible with H.264 High profile.
+                _vid_settings = _SCVideoSettings(_SCMode.SMARTCUT, _SCQuality.NORMAL, 'copy')
+                _exc = _sc_api(_src, _segs, output_path,
+                               audio_export_info=_export_info,
+                               video_settings=_vid_settings)
+            finally:
+                _src.close()
+            if _exc is not None:
+                raise _exc
+        except Exception as _api_err:
+            raise RuntimeError(f"smartcut API failed: {_api_err}") from _api_err
 
         elapsed = time.monotonic() - t0
 
@@ -994,6 +855,11 @@ def smart_cut(input_path, start, end, output_path, audio_idx=0, window=8.0, max_
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+    if SELF_CHECK:
+        verify_cut(output_path, _expected_frames)  # before tag stripping: it reads the stream durations
+    if STRIP_STALE_TAGS:
+        strip_stale_tags(output_path)
+
     # --- Post-cut report ---
     try:
         out_size = os.path.getsize(output_path)
@@ -1005,11 +871,11 @@ def smart_cut(input_path, start, end, output_path, audio_idx=0, window=8.0, max_
     log(f"  SUCCESS! Output saved to: {output_path}")
 
 
-def compress_cut(input_path, start, end, output_path, audio_idx=0, crf=COMPRESS_CRF, preset=COMPRESS_PRESET):
+def compress_cut(input_path, start, end, output_path, crf=COMPRESS_CRF, preset=COMPRESS_PRESET):
     """Plain re-encode of the whole marked range - no GOP-boundary keyframe
     bracketing or stream-copy splicing, just one clean cut re-encoded at a
     normal delivery CRF. Much smaller output than Smart Cut; use that
-    instead if you need archival/near-lossless quality."""
+    instead if you need archival quality."""
     if end <= start: raise RuntimeError("end must be after start")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     video, audios, subtitles = probe_streams(input_path)
@@ -1468,17 +1334,16 @@ if __name__ == "__main__":
     p.add_argument("output")
     p.add_argument("--start-frame", type=int, default=None,
                    help="mpv estimated-frame-number at mark A (0-based). "
-                        "When provided, smartcut uses --frames mode for exact precision.")
+                        "Used only when CUT_MARKS = \"frames\".")
     p.add_argument("--end-frame", type=int, default=None,
                    help="mpv estimated-frame-number at mark B (0-based).")
     args = p.parse_args()
-    resolved_input = resolve_disc_input(args.input)
     if args.output.endswith(".png"):
-        pan_smash(resolved_input, args.start, args.end, args.output)
+        pan_smash(args.input, args.start, args.end, args.output)
     elif args.output.endswith(".gif"):
-        make_gif(resolved_input, args.start, args.end, args.output)
+        make_gif(args.input, args.start, args.end, args.output)
     elif args.output.endswith(".compressed.mkv"):
-        compress_cut(resolved_input, args.start, args.end, args.output)
+        compress_cut(args.input, args.start, args.end, args.output)
     else:
-        smart_cut(resolved_input, args.start, args.end, args.output,
+        smart_cut(args.input, args.start, args.end, args.output,
                   start_frame=args.start_frame, end_frame=args.end_frame)

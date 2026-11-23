@@ -1,0 +1,13 @@
+diff --git a/src/vulkan/utils_gen.py b/src/vulkan/utils_gen.py
+index 9b803d8..9efb757 100644
+--- a/src/vulkan/utils_gen.py
++++ b/src/vulkan/utils_gen.py
+@@ -47,6 +47,8 @@ class VkXML(ET.ElementTree):
+ 
+     def __init__(self, *args, **kwargs):
+ 
++        if args and isinstance(args[0], ET.ElementTree):
++            args = (args[0].getroot(),) + args[1:]
+         super().__init__(*args, **kwargs)
+         self.blacklist_types = set()
+         self.blacklist_enums = set()

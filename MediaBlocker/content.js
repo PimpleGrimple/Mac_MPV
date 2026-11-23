@@ -57,6 +57,39 @@
   const EXCEPTION_PATTERNS = [];
   const BLOCK_KEYWORDS = ['.m4s', '.ts', '_init.mp4', 'init-', '/init', '/segment', '/frag', 'seg-'];
 
+  // Settings arrive from storage / the popup: apply them defensively, so one malformed value
+  // can't throw halfway through and leave the rest of the settings (or the whole script)
+  // unapplied.
+  const KNOWN_TYPES = ['image', 'video', 'audio', 'font', 'subtitle'];
+  const strings = list => (Array.isArray(list) ? list.filter(x => typeof x === 'string' && x) : []);
+
+  function applyTypes(list) {
+    if (!Array.isArray(list)) return;
+    BLOCK_TYPES = { image: false, video: false, audio: false, font: false, subtitle: false };
+    list.forEach(t => { if (KNOWN_TYPES.includes(t)) BLOCK_TYPES[t] = true; });
+  }
+  function applyKeywords(list) {
+    if (!Array.isArray(list)) return;
+    BLOCK_KEYWORDS.length = 0;
+    BLOCK_KEYWORDS.push(...strings(list));
+  }
+  function applyExceptions(list) {
+    if (!Array.isArray(list)) return;
+    EXCEPTIONS.length = 0;
+    EXCEPTIONS.push(...strings(list));
+    EXCEPTION_PATTERNS.length = 0;
+    for (const pat of EXCEPTIONS) {
+      if (pat.includes('*')) {
+        try {
+          const esc = pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+          EXCEPTION_PATTERNS.push({ type: 're', re: new RegExp(esc, 'i') });
+        } catch (e) { /* unusable pattern: skip it, keep the others */ }
+      } else {
+        EXCEPTION_PATTERNS.push({ type: 'str', str: pat.toLowerCase() });
+      }
+    }
+  }
+
   chrome.storage.local.get(['GLOBAL_MODE', 'DISABLED_SITES', 'TYPES', 'BLOCK_KEYWORDS', 'EXCEPTIONS'], function(result) {
     if (result.GLOBAL_MODE) {
       GLOBAL_MODE = result.GLOBAL_MODE;
@@ -75,26 +108,9 @@
       }
     }
 
-    if (result.TYPES) {
-      BLOCK_TYPES = { image: false, video: false, audio: false, font: false, subtitle: false };
-      result.TYPES.forEach(t => BLOCK_TYPES[t] = true);
-    }
-    if (result.BLOCK_KEYWORDS) {
-      BLOCK_KEYWORDS.length = 0;
-      BLOCK_KEYWORDS.push(...result.BLOCK_KEYWORDS);
-    }
-    if (result.EXCEPTIONS) {
-      EXCEPTIONS.length = 0;
-      EXCEPTIONS.push(...result.EXCEPTIONS);
-      EXCEPTION_PATTERNS.length = 0;
-      EXCEPTION_PATTERNS.push(...EXCEPTIONS.map(pat => {
-        if (pat.includes('*')) {
-          const esc = pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-          return { type: 're', re: new RegExp(esc, 'i') };
-        }
-        return { type: 'str', str: pat.toLowerCase() };
-      }));
-    }
+    applyTypes(result.TYPES);
+    applyKeywords(result.BLOCK_KEYWORDS);
+    applyExceptions(result.EXCEPTIONS);
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
@@ -113,26 +129,9 @@
             }
       }
       if (changes.MODE) MODE = changes.MODE.newValue;
-      if (changes.TYPES) {
-        BLOCK_TYPES = { image: false, video: false, audio: false, font: false, subtitle: false };
-        changes.TYPES.newValue.forEach(t => BLOCK_TYPES[t] = true);
-      }
-      if (changes.BLOCK_KEYWORDS) {
-        BLOCK_KEYWORDS.length = 0;
-        BLOCK_KEYWORDS.push(...changes.BLOCK_KEYWORDS.newValue);
-      }
-      if (changes.EXCEPTIONS) {
-        EXCEPTIONS.length = 0;
-        EXCEPTIONS.push(...changes.EXCEPTIONS.newValue);
-        EXCEPTION_PATTERNS.length = 0;
-        EXCEPTION_PATTERNS.push(...EXCEPTIONS.map(pat => {
-          if (pat.includes('*')) {
-            const esc = pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-            return { type: 're', re: new RegExp(esc, 'i') };
-          }
-          return { type: 'str', str: pat.toLowerCase() };
-        }));
-      }
+      if (changes.TYPES) applyTypes(changes.TYPES.newValue);
+      if (changes.BLOCK_KEYWORDS) applyKeywords(changes.BLOCK_KEYWORDS.newValue);
+      if (changes.EXCEPTIONS) applyExceptions(changes.EXCEPTIONS.newValue);
     }
   });
 
@@ -670,6 +669,9 @@
     const playUrl = fmt ? state.url : (state.selectedUrl || state.url);
     const payload = { url: playUrl };
     if (state.ref) payload.ref = state.ref;
+    // Cross-origin CDNs often require the Origin the page's player sent next to the Referer.
+    const origin = self.MPV && state.ref ? self.MPV.originFor(self.MPV.cleanRef(state.ref), playUrl) : '';
+    if (origin) payload.origin = origin;
     if (navigator.userAgent) payload.ua = navigator.userAgent;
     if (fmt) {
       payload.format = fmt;
@@ -790,12 +792,21 @@
     }, 120);
   }
 
+  // Both capture channels (service worker, and frames relaying up) go through this check:
+  // a known media type and an http(s) URL as a string. A page can post anything at all to
+  // its own window, so nothing from the relay channel is trusted as-is.
+  const CAPTURE_TYPES = ['video', 'audio', 'image', 'font', 'subtitle'];
+  function validCapture(type, url) {
+    return CAPTURE_TYPES.includes(type) && typeof url === 'string' && url.length <= 16384 && /^https?:\/\//i.test(url);
+  }
+
   // Captures broadcast by the service worker (chrome.tabs.sendMessage reaches every
   // injected frame in the tab, so only the top frame acts on it).
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.__mbCapture) {
+    if (msg && msg.__mbCapture) {
       if (!IS_TOP) return;
-      recordResolved(msg.type, msg.url, msg.ref || location.href, null, null);
+      if (!validCapture(msg.type, msg.url)) return;
+      recordResolved(msg.type, msg.url, typeof msg.ref === 'string' && msg.ref ? msg.ref : location.href, null, null);
     }
   });
 
@@ -806,11 +817,19 @@
   // Captures relayed up from embedded iframes (see record()) join this frame's list.
   if (IS_TOP) {
     window.addEventListener('message', e => {
-      if (!e.data || !e.data.__mbCapture) return;
+      if (!e.data || e.data.__mbCapture !== true) return;
+      // Relays come from child frames. The top page's own scripts also post to this window,
+      // so a message whose source is the window itself is the page, not our script.
+      if (!e.source || e.source === window) return;
       let { type, url, ref } = e.data;
-      if (!url) return;
-      try { url = new URL(url, ref || e.origin).href; } catch (err) {}
-      recordResolved(type, url, ref || e.origin || location.href, null, null);
+      if (typeof url !== 'string' || !url) return;
+      try { url = new URL(url, typeof ref === 'string' && ref ? ref : e.origin).href; } catch (err) { return; }
+      // The relayed referer must belong to the frame that sent it, since it later becomes the
+      // Referer/Origin handed to yt-dlp and mpv. e.origin is set by the browser; ref is not.
+      let relayRef = e.origin && e.origin !== 'null' ? e.origin + '/' : location.href;
+      try { if (typeof ref === 'string' && new URL(ref).origin === e.origin) relayRef = ref; } catch (err) { /* keep origin */ }
+      if (!validCapture(type, url)) return;
+      recordResolved(type, url, relayRef, null, null);
     });
   }
 
@@ -849,7 +868,7 @@
       format: fmt,
       ref: state.ref,
       ua: navigator.userAgent,
-      title: document.title || 'video'
+      title: pageVideoTitle()
     };
     // Sites that serve one file per quality (site-adapters.js): the bridge picks per action.
     if (!fmt && (type === 'video' || type === 'audio') && self.MBSites) {
@@ -858,6 +877,101 @@
     }
     return req;
   }
+
+  // ---------------------------------------------------------------------------
+  // Video titles for downloads / mpv. The page title is only a last resort: a page with
+  // several videos has one title, and downloads named after it overwrite each other.
+  // ---------------------------------------------------------------------------
+  const tidy = t => String(t || '').replace(/\s+/g, ' ').trim();
+  const okTitle = t => t.length >= 2 && t.length <= 300 && !/^https?:\/\//i.test(t);
+
+  function cleanPageTitle() {
+    let t = tidy(document.title);
+    if (/(^|\.)youtube\.com$/i.test(location.hostname)) t = t.replace(/^\(\d+\)\s*/, '').replace(/\s+-\s+YouTube$/i, '');
+    return t;
+  }
+
+  // The title of the video this page is about.
+  function pageVideoTitle() {
+    try {
+      const onYT = /(^|\.)youtube\.com$/i.test(location.hostname);
+      if (!onYT) {
+        const vids = Array.from(document.querySelectorAll('video'));
+        const v = vids.find(x => !x.paused && x.readyState > 0) || vids[0];
+        if (v) {
+          for (const a of ['title', 'aria-label', 'data-title']) {
+            const t = tidy(v.getAttribute(a));
+            if (okTitle(t)) return t;
+          }
+        }
+        const metas = ['meta[property="og:video:title"]', 'meta[property="og:title"]', 'meta[name="twitter:title"]', 'meta[name="title"]'];
+        for (const sel of metas) {
+          const m = document.querySelector(sel);
+          const t = tidy(m && m.content);
+          if (okTitle(t)) return t;
+        }
+        for (const sc of document.querySelectorAll('script[type="application/ld+json"]')) {
+          try {
+            const walk = n => {
+              if (Array.isArray(n)) return n.map(walk).find(Boolean);
+              if (n && typeof n === 'object') {
+                if (/VideoObject/i.test(String(n['@type'])) && n.name) return tidy(n.name);
+                return walk(n['@graph']);
+              }
+            };
+            const t = walk(JSON.parse(sc.textContent));
+            if (t && okTitle(t)) return t;
+          } catch (e) { /* bad JSON-LD */ }
+        }
+        const h1s = document.querySelectorAll('h1');
+        if (h1s.length === 1) { const t = tidy(h1s[0].textContent); if (okTitle(t)) return t; }
+      }
+    } catch (e) { /* fall through */ }
+    return cleanPageTitle() || 'video';
+  }
+
+  // The title belonging to the element that was right-clicked: the link's own title/text,
+  // the <video>'s title, or the nearest card's heading (thumbnail links have no text).
+  function elementTitle(el) {
+    try {
+      const attrTitle = n => {
+        for (const a of ['title', 'aria-label', 'data-title', 'alt']) {
+          const t = tidy(n.getAttribute && n.getAttribute(a));
+          if (okTitle(t)) return t;
+        }
+        return '';
+      };
+      const own = el.closest && el.closest('a, video, audio');
+      if (own) {
+        const t = attrTitle(own);
+        if (t) return t;
+        const img = own.querySelector && own.querySelector('img[alt]');
+        const alt = img ? tidy(img.alt) : '';
+        const txt = tidy(own.textContent);
+        if (txt.length >= 3 && txt.length <= 200) return txt;
+        if (okTitle(alt)) return alt;
+      }
+      let node = el;
+      for (let i = 0; i < 6 && node && node !== document.body; i++, node = node.parentElement) {
+        const heads = node.querySelectorAll('#video-title, h1, h2, h3, h4, [class*="title" i]');
+        if (heads.length > 3) break;   // a whole list, not one card
+        for (const h of heads) {
+          const t = tidy(h.getAttribute('title') || h.textContent);
+          if (okTitle(t) && t.length <= 200) return t;
+        }
+      }
+    } catch (e) { /* fall through */ }
+    return '';
+  }
+
+  // Remember what was right-clicked (any frame) so the service worker can ask for it.
+  let lastContextEl = null, lastContextAt = 0;
+  document.addEventListener('contextmenu', e => { lastContextEl = e.target; lastContextAt = Date.now(); }, true);
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || !msg.__mbMenuTitle) return;
+    const fresh = lastContextEl && Date.now() - lastContextAt < 120000;
+    sendResponse({ ok: true, title: fresh ? elementTitle(lastContextEl) : '', page: pageVideoTitle() });
+  });
 
   if (self.MPV) {
     let prefs = Object.assign({}, self.MPV.DEFAULTS);
@@ -902,7 +1016,7 @@
       const video = mainVideo();
       if (!req) {
         if (!/^https?:/i.test(location.href)) return done({ ok: false, error: 'Not a playable page' });
-        req = { url: location.href, title: document.title || 'video' };
+        req = { url: location.href, title: pageVideoTitle() };
         if (prefs.startFromCurrentTime && video && video.currentTime > 0) req.startTime = video.currentTime;
       }
       if (prefs.autoPause && video && !video.paused) video.pause();

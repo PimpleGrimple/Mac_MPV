@@ -31,6 +31,10 @@ const rowEls = new Map();      // entry id -> row element
 let refreshTimer = null;
 let previewToken = 0;
 
+// Entry URLs come from the page being browsed. Only http(s) is ever put in a link or an
+// <img> in this (privileged) page; javascript:, file:, chrome-extension: and so on are not.
+const isWebUrl = u => typeof u === 'string' && /^https?:\/\//i.test(u);
+
 function el(tag, className) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -133,6 +137,7 @@ function previewEl() {
 }
 
 function showPreview(icon, url) {
+  if (!isWebUrl(url)) return;
   const token = ++previewToken;
   const box = previewEl();
   const img = box.querySelector('img');
@@ -272,7 +277,8 @@ function syncQuality(row, e) {
 function updateRow(row, e) {
   row._entry = e;
   row.dataset.type = e.type;
-  row._icon.href = e.selectedUrl;
+  if (isWebUrl(e.selectedUrl)) row._icon.href = e.selectedUrl;
+  else row._icon.removeAttribute('href');
   row._name.textContent = e.name;
   syncQuality(row, e);
   applyExpiry(row, e);

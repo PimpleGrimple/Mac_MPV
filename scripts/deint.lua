@@ -1,140 +1,220 @@
-local mp = require "mp"
+local msg = require "mp.msg"
 local options = require "mp.options"
+local utils = require "mp.utils"
+
+-- Publishes user-data/deint (boolean): true while one of our filters runs.
+
+-- ── Filter templates ─────────────────────────────────────────────────────────
+-- {o} = detected field order (tff / bff / auto), {field} = tf / bf (for NNEDI).
+-- Raise cthresh / swap pc_n for cleaner sources.
+local FIELDMATCH = "fieldmatch=order={o}:combmatch=full:cthresh=8:mode="
+local BWDIF      = "bwdif=mode=1:parity={o}:deint=interlaced"
+
+-- Alternative interlacers, swap in for BWDIF:
+--  nnedi   anime line art / text; shimmers on grain (qual=fast is 2x faster)
+--          "nnedi=weights=~/.config/mpv/VapourSynth/models/nnedi3/nnedi3_weights.bin:nns=n32:qual=slow:field={field}:deint=interlaced"
+--  estdif  very fast edge-directed; plastic on fine detail
+--          "estdif=mode=field:parity={o}:deint=interlaced"
+--  w3fdif  natural live-action motion; soft on anime
+--          "w3fdif=filter=complex"
+--  mcdeint smooth slow pans; warps anime / fast cuts
+--          "yadif=mode=1:parity={o}:deint=interlaced,mcdeint=mode=medium:parity=-1"
+
+-- One table drives everything: filter template (f), OSD text (label) and the
+-- vf label (the id, shown as "@telecine:" in the info panel). No f = no filter.
+local CHAINS = {
+    auto = { label = "Auto (detected)" },
+    off  = { label = "Off" },
+    -- clean 3:2 pulldown → 23.976fps
+    telecine = { label = "Telecine: fieldmatch + decimate",        f = FIELDMATCH .. "pc_n,decimate" },
+    -- genuine interlaced video → field rate
+    bob      = { label = "Bob: bwdif field-rate",                  f = BWDIF },
+    -- telecine with bad edits/inserts → 23.976fps
+    mix      = { label = "Mix: fieldmatch + decimate + bwdif",     f = FIELDMATCH .. "pcn_ub,decimate=mixed=1," .. BWDIF },
+    -- fieldmatch + full bob, no decimate → field-rate CFR
+    hybrid   = { label = "Hybrid: fieldmatch + bwdif field-rate",  f = FIELDMATCH .. "pcn_ub," .. BWDIF },
+}
+local CYCLE = { "auto", "telecine", "bob", "mix", "hybrid", "off" }
+
+-- vsdetect cadence -> chain. Anything else runs no filter.
+local DETECT = {
+    telecine = "telecine", interlaced = "bob",
+    mix_telecine = "mix", mix_interlaced = "hybrid",
+}
+local ORDER = { tff = "tff", tt = "tff", tb = "tff", bff = "bff", bb = "bff", bt = "bff" }
 
 local opts = {
-    auto_scan_sd = true,
+    auto_scan_sd   = true,      -- scan SD (<= 576p) files automatically on load
+    auto_scan_osd  = true,      -- one-line OSD when an automatic scan finishes
+    chain          = "auto",    -- default chain: auto | telecine | bob | mix | hybrid | off
 }
+options.read_options(opts, "deint")
 
-local LABEL = "deint"
-local DEFAULT_HWDEC = mp.get_property("hwdec", "no")
+local VSDETECT  = mp.command_native({ "expand-path", "~~/VapourSynth/bin/vsdetect" })
+local CACHE_DIR = mp.command_native({ "expand-path", "~~/cache/scripts/deint" })
 
-local active_vf = ""
-local osd_visible = false
-local osd_serial = 0
-local file_epoch = 0
-local scanning_path, scanning_epoch
-local pending_scan, cached_result
+--------------------------------------------------------------------------
+-- State
+--------------------------------------------------------------------------
+local forced = CHAINS[opts.chain] and opts.chain or "auto"  -- manual pick (Shift+X)
+local default_forced = forced        -- what "no per-file override" means
+local file_id, file_entry = nil, {}  -- persistent cache entry of the current file
+local active_vf, published           -- filter installed / user-data/deint published right now
+local saved_hwdec                    -- hwdec value we replaced while filtering
+local scan_token                     -- in-flight vsdetect, if any
+local osd_until = 0                  -- when our OSD message expires
 
 local function show(text, duration, silent)
     if silent then return end
-
     duration = duration or 3
-    osd_serial = osd_serial + 1
-    local serial = osd_serial
     mp.osd_message(text, duration)
-    osd_visible = text ~= "" and duration ~= 0
-
-    if osd_visible then
-        mp.add_timeout(duration, function()
-            if osd_serial == serial then osd_visible = false end
-        end)
-    end
+    osd_until = (text ~= "" and duration > 0) and mp.get_time() + duration or 0
 end
 
+--------------------------------------------------------------------------
+-- Applying a chain
+--------------------------------------------------------------------------
+-- Drop any filter carrying one of our labels (also catches one restored from
+-- watch-later or config), leaving everyone else's filters alone.
 local function remove_ours()
-    local filters = mp.get_property_native("vf") or {}
-    local changed = false
-
-    for i = #filters, 1, -1 do
-        if filters[i].label == LABEL then
-            table.remove(filters, i)
-            changed = true
-        end
+    local vf = mp.get_property_native("vf") or {}
+    local keep = {}
+    for _, f in ipairs(vf) do
+        local c = CHAINS[f.label or ""]
+        if not (c and c.f) then keep[#keep + 1] = f end
     end
-
-    if changed then mp.set_property_native("vf", filters) end
+    if #keep ~= #vf then mp.set_property_native("vf", keep) end
 end
 
-local function sync_filter()
-    remove_ours()
-
-    if active_vf == "" then
-        mp.set_property("hwdec", DEFAULT_HWDEC)
-        return
-    end
-
-    local hwdec = mp.get_property("hwdec", "no")
-    if hwdec ~= "no" and not hwdec:match("-copy$") then
+-- Software filters need system-memory frames: switch a hardware decoder to
+-- its copy variant while one runs and put back exactly what we replaced.
+local function set_hwdec(filtering)
+    if filtering then
+        if saved_hwdec then return end
+        local cur = mp.get_property("hwdec", "no")
+        if cur == "no" or cur:find("%-copy$") then return end
+        saved_hwdec = cur
         mp.set_property("hwdec", "auto-copy")
+    elseif saved_hwdec then
+        mp.set_property("hwdec", saved_hwdec)
+        saved_hwdec = nil
     end
-
-    mp.commandv("vf", "add", "@" .. LABEL .. ":" .. active_vf)
 end
 
-local function apply_cadence(vf, status)
+-- id: chain id or nil (nil = no filter).
+local function apply(id, order)
+    local c = id and CHAINS[id]
+    local vf
+    if c and c.f then
+        local o = order or "auto"
+        vf = "lavfi=[" .. c.f:gsub("{o}", o):gsub("{field}", o == "bff" and "bf" or "tf") .. "]"
+    end
+
+    -- Native boolean on purpose: a string "no" would be truthy in profile-cond.
+    local deint = vf ~= nil
+    if deint ~= published then
+        published = deint
+        mp.set_property_native("user-data/deint", deint)
+    end
+    if vf == active_vf then return end
+
+    remove_ours()
     active_vf = vf
-    mp.set_property("user-data/cadence", status)
-    sync_filter()
+    set_hwdec(deint)
+    if vf then mp.commandv("vf", "add", "@" .. id .. ":" .. vf) end
 end
 
-options.read_options(opts, "deint")
-
-local function normalize_order(raw)
-    if raw == "bff" or raw == "bb" or raw == "bt" then return "bff" end
-    if raw == "tff" or raw == "tt" or raw == "tb" then return "tff" end
-    return nil
+local function apply_scan(s)
+    apply(DETECT[s.cadence], s.order)
 end
 
-local function split_pipe(text)
-    local fields = {}
-    for field in (text .. "|"):gmatch("(.-)|") do
-        fields[#fields + 1] = field
+-- The chain forced on this file (manual pick), or nil when the detector's
+-- result is what runs.
+local function override_name()
+    if forced ~= "auto" then return forced end
+end
+
+-- What should be running: manual pick > saved scan. False = nothing applies yet.
+local function settle()
+    local o = override_name()
+    if o then
+        apply(o)
+        return true
     end
-    return fields
+    if file_entry.scan then
+        apply_scan(file_entry.scan)
+        return true
+    end
+    apply(nil)
+    return false
 end
 
 --------------------------------------------------------------------------
--- Disc sources (dvd://, bd://) have no seekable file path of their own, so
--- vsdetect -- which only accepts a regular file -- was being handed the
--- literal "dvd://" and failing every scan. Resolve a disc to the first VOB
--- (or largest M2TS) of its biggest title set before scanning.
+-- OSD report
 --------------------------------------------------------------------------
-local has_utils, utils = pcall(require, "mp.utils")
+local function setup_text(s)
+    local o = override_name()
+    if o then return CHAINS[o].label .. " (manual)" end
+    local id = DETECT[s.cadence]
+    return id and CHAINS[id].label
+        or (s.cadence:gsub("^%l", string.upper):gsub("_", " ")) .. " (no filter)"
+end
+
+local function build_report(s)
+    return string.format(
+        "● Cadence:       %s\n" ..
+        "● Field Order:   %s\n" ..
+        "● Setup:           %s\n" ..
+        "──────────────────────────────\n" ..
+        "[Frame Structure]\n" ..
+        "  ├─ Interlaced:  %.1f%%\n" ..
+        "  └─ Progressive: %.1f%%\n" ..
+        "[Cadence Signature]\n" ..
+        "  └─ Repeat Field Ratio: %.1f%%",
+        s.cadence, s.order and s.order:upper() or "AUTO / unknown", setup_text(s),
+        s.interlaced * 100, s.progressive * 100, s.repeat_ratio * 100)
+end
+
+--------------------------------------------------------------------------
+-- Scan target. vsdetect only takes a regular file, so a disc (dvd://, bd://)
+-- or a VIDEO_TS folder is resolved to the main title's first VOB / largest
+-- M2TS.
+--------------------------------------------------------------------------
+local DISC = { dvd = "dvd", dvdnav = "dvd", bd = "bd", bluray = "bd", br = "bd" }
 
 local function is_dir(path)
-    if not has_utils or type(utils.file_info) ~= "function" then return false end
     local info = utils.file_info(path)
-    return info ~= nil and info.is_dir == true
+    return info ~= nil and info.is_dir
 end
 
-local function first_vob_of_largest_set(video_ts)
-    if not has_utils or type(utils.readdir) ~= "function" then return nil end
-    local entries = utils.readdir(video_ts)
-    if not entries then return nil end
-
-    -- Group VOB sizes per VTS set and keep the biggest set (the main title),
-    -- then start at its first part. Per-VOB sizes alone are useless here:
-    -- a title is split across VTS_xx_1..N at ~1 GiB boundaries.
-    local totals = {}
-    for _, name in ipairs(entries) do
-        local set = name:match("^[Vv][Tt][Ss]_(%d%d)_%d+%.[Vv][Oo][Bb]$")
+-- First VOB of the biggest title set. A title is split across VTS_xx_1..N at
+-- ~1 GiB, so sizes are summed per set, not compared per file.
+local function main_vob(dir)
+    local sizes, firsts = {}, {}
+    for _, name in ipairs(utils.readdir(dir) or {}) do
+        local set, part = name:match("^[Vv][Tt][Ss]_(%d%d)_(%d+)%.[Vv][Oo][Bb]$")
         if set then
-            local info = utils.file_info(video_ts .. "/" .. name)
+            local info = utils.file_info(dir .. "/" .. name)
             if info and info.is_file then
-                totals[set] = (totals[set] or 0) + (info.size or 0)
+                sizes[set] = (sizes[set] or 0) + info.size
+                if part == "1" then firsts[set] = name end
             end
         end
     end
-
-    local best, best_size = nil, -1
-    for set, size in pairs(totals) do
-        if size > best_size then best, best_size = set, size end
+    local best
+    for set, size in pairs(sizes) do
+        if firsts[set] and (not best or size > sizes[best]) then best = set end
     end
-    if not best then return nil end
-
-    local first = video_ts .. "/VTS_" .. best .. "_1.VOB"
-    if utils.file_info(first) then return first end
-    return nil
+    return best and (dir .. "/" .. firsts[best])
 end
 
-local function largest_m2ts(stream_dir)
-    if not has_utils or type(utils.readdir) ~= "function" then return nil end
+local function largest_m2ts(dir)
     local best, best_size = nil, -1
-    for _, name in ipairs(utils.readdir(stream_dir) or {}) do
+    for _, name in ipairs(utils.readdir(dir) or {}) do
         if name:lower():match("%.m2ts$") then
-            local info = utils.file_info(stream_dir .. "/" .. name)
-            if info and info.is_file and (info.size or 0) > best_size then
-                best, best_size = stream_dir .. "/" .. name, info.size
+            local info = utils.file_info(dir .. "/" .. name)
+            if info and info.is_file and info.size > best_size then
+                best, best_size = dir .. "/" .. name, info.size
             end
         end
     end
@@ -142,186 +222,230 @@ local function largest_m2ts(stream_dir)
 end
 
 local function resolve_scan_target(path)
-    if not path or path == "" then return nil end
-    local lower = path:lower()
-
-    if lower:match("^dvd") or lower:match("^bd") then
-        local is_bd = lower:match("^bd") ~= nil
-        local dev = mp.get_property(is_bd and "bluray-device" or "dvd-device", "")
-        if not dev or dev == "" then return nil end
-        if dev:sub(1, 1) == "~" then
-            dev = mp.command_native({ "expand-path", dev }) or dev
-        end
-        if is_bd then
-            local stream = dev .. "/BDMV/STREAM"
-            return is_dir(stream) and largest_m2ts(stream) or nil
-        end
-        local video_ts = is_dir(dev .. "/VIDEO_TS") and (dev .. "/VIDEO_TS") or dev
-        return first_vob_of_largest_set(video_ts)
+    local kind = DISC[path:match("^(%a[%w+.-]*)://")]
+    local root = path
+    if kind then
+        root = mp.get_property(kind == "bd" and "bluray-device" or "dvd-device", "")
+        if root == "" then return nil end
+        root = mp.command_native({ "expand-path", root })
     end
-
-    -- Opening a VIDEO_TS folder directly hits the same vsdetect limitation.
-    if is_dir(path) then
-        local video_ts = is_dir(path .. "/VIDEO_TS") and (path .. "/VIDEO_TS") or path
-        return first_vob_of_largest_set(video_ts)
+    if kind == "bd" then return largest_m2ts(root .. "/BDMV/STREAM") end
+    if kind == "dvd" or is_dir(root) then
+        local sub = root .. "/VIDEO_TS"
+        return main_vob(is_dir(sub) and sub or root)
     end
-
     return path
 end
 
-local run_cadence_scan
-run_cadence_scan = function(is_auto)
+--------------------------------------------------------------------------
+-- Persistent cache: ~~/cache/scripts/deint/<hash>.json, one small file per
+-- source holding { id, scan, override }. The id is resolved path + size +
+-- mtime, so replacing or re-encoding a file invalidates its entry. Sources
+-- that can't be stat'ed (streams) are simply not cached on disk.
+--------------------------------------------------------------------------
+-- Two independent 32-bit hashes -> 16 hex chars. The full id is re-checked on
+-- read, so a collision can only cause a cache miss, never a wrong result.
+local function hash_id(s)
+    local h1, h2 = 5381, 52711
+    for i = 1, #s do
+        local b = s:byte(i)
+        h1 = (h1 * 33 + b) % 4294967296
+        h2 = (h2 * 131 + b) % 4294967291
+    end
+    return string.format("%08x%08x", h1, h2)
+end
+
+local function entry_path(id)
+    return CACHE_DIR .. "/" .. hash_id(id) .. ".json"
+end
+
+local function identity_for(path)
+    local target = resolve_scan_target(path)
+    if not target then return nil end
+    target = utils.join_path(mp.get_property("working-directory", ""), target)
+
+    local info = utils.file_info(target)
+    if not (info and info.is_file) then return nil end
+    return string.format("%s|%d|%d", target, info.size, info.mtime)
+end
+
+local function valid_scan(s)
+    return type(s) == "table" and type(s.cadence) == "string"
+        and type(s.interlaced) == "number" and type(s.progressive) == "number"
+        and type(s.repeat_ratio) == "number"
+end
+
+local function read_entry(id)
+    local f = io.open(entry_path(id))
+    if not f then return {} end
+    local entry = utils.parse_json(f:read("*a"))
+    f:close()
+
+    if type(entry) ~= "table" or entry.id ~= id then return {} end
+    if not valid_scan(entry.scan) then entry.scan = nil end
+    if not (CHAINS[entry.override] and entry.override ~= "auto") then
+        entry.override = nil
+    end
+    return entry
+end
+
+local function save_entry()
+    if not file_id then return end
+    local p = entry_path(file_id)
+
+    -- Nothing worth keeping: remove the file instead of leaving an empty one.
+    if not (file_entry.scan or file_entry.override) then
+        os.remove(p)
+        return
+    end
+
+    file_entry.id = file_id
+    local json = utils.format_json(file_entry)
+    if not json then return end
+
+    local f = io.open(p, "w")
+    if not f then  -- first save: the cache dir doesn't exist yet
+        mp.command_native({
+            name = "subprocess", playback_only = false,
+            args = { "mkdir", "-p", CACHE_DIR },
+        })
+        f = io.open(p, "w")
+    end
+    if f then f:write(json); f:close() end
+end
+
+--------------------------------------------------------------------------
+-- Scanning
+--------------------------------------------------------------------------
+local function parse_scan(out)
+    local f = {}
+    for field in (out .. "|"):gmatch("(.-)|") do f[#f + 1] = field end
+    if #f < 13 or f[9] == "" then return nil end
+
+    local s = {
+        cadence = f[9], order = ORDER[f[10]],
+        interlaced = tonumber(f[11]) or 0,
+        progressive = tonumber(f[12]) or 0,
+        repeat_ratio = tonumber(f[13]) or 0,
+    }
+    -- All-zero ratios are how vsdetect flags metadata-only soft telecine.
+    if s.cadence == "telecine" and s.interlaced == 0
+        and s.progressive == 0 and s.repeat_ratio == 0 then
+        s.cadence = "soft_telecine"
+    end
+    return s
+end
+
+local function run_cadence_scan(auto, force)
     local path = mp.get_property("path")
-    if not path or path == "" then return end
+    if not path then return end
 
-    if cached_result and cached_result.path == path then
-        if active_vf ~= cached_result.vf
-            or mp.get_property("user-data/cadence") ~= cached_result.status then
-            apply_cadence(cached_result.vf, cached_result.status)
-        end
-        show(cached_result.text, 8, is_auto)
+    local cached = file_entry.scan
+    if cached and not force then
+        if not override_name() then apply_scan(cached) end
+        show(build_report(cached), 8, auto)
         return
     end
-
-    if scanning_path then
-        if scanning_path ~= path or scanning_epoch ~= file_epoch then
-            pending_scan = { path = path, auto = is_auto, epoch = file_epoch }
-        end
-        return
-    end
-
-    local exe = mp.command_native({ "expand-path", "~~/VapourSynth/bin/vsdetect" })
-    if not exe or exe == "" then
-        show("Scan failed: vsdetect path unavailable", 3, is_auto)
-        return
-    end
+    if scan_token then return end  -- one at a time; a stale one dies on end-file
 
     local target = resolve_scan_target(path)
     if not target then
-        show("Scan failed: cannot resolve disc path", 3, is_auto)
-        return
+        return show("Scan failed: cannot resolve disc path", 3, auto)
     end
 
-    local args = { exe, target }
-    -- Manual scans should be able to inspect HD sources instead of trusting
-    -- incomplete or missing stream field-order metadata.
-    if not is_auto then args[#args + 1] = "--scan-hd" end
+    local args = { VSDETECT, target }
+    -- Manual scans may inspect HD sources instead of trusting missing or
+    -- incomplete field-order metadata.
+    if not auto then args[3] = "--scan-hd" end
 
-    show("Scanning cadence...", 10, is_auto)
-    scanning_path, scanning_epoch = path, file_epoch
-    local scan_epoch = file_epoch
+    show("Scanning cadence...", 10, auto)
 
-    mp.command_native_async({
-        name = "subprocess",
-        playback_only = false,
-        capture_stdout = true,
-        capture_stderr = true,
+    local token
+    token = mp.command_native_async({
+        name = "subprocess", playback_only = false,
+        capture_stdout = true, capture_stderr = true,
         args = args,
-    }, function(success, result)
-        scanning_path, scanning_epoch = nil, nil
+    }, function(ok, res)
+        if scan_token ~= token then return end  -- file changed, scan was aborted
+        scan_token = nil
 
-        if scan_epoch == file_epoch and mp.get_property("path") == path then
-            if not success or not result or result.status ~= 0 then
-                show("Scan failed", 3, is_auto)
-            else
-                local fields = split_pipe((result.stdout or ""):gsub("%s+$", ""))
-
-                if #fields < 13 or fields[9] == "" then
-                    show("Invalid vsdetect output", 3, is_auto)
-                else
-                    local status, raw_order = fields[9], fields[10]
-                    local interlaced = tonumber(fields[11]) or 0
-                    local progressive = tonumber(fields[12]) or 0
-                    local repeat_ratio = tonumber(fields[13]) or 0
-                    local order = normalize_order(raw_order) or "auto"
-
-                    -- vsdetect signals metadata-only soft telecine with all-zero
-                    -- ratios. It already accounts for this case explicitly.
-                    if status == "telecine" and interlaced == 0
-                        and progressive == 0 and repeat_ratio == 0 then
-                        status = "soft_telecine"
-                    end
-
-                    local vf, setup = "", "Progressive (no filter)"
-
-                    if status == "telecine" then
-                        setup = "Telecine: fieldmatch + decimate"
-                        vf = string.format(
-                            "lavfi=[fieldmatch=order=%s:mode=pcn_ub:combmatch=full:cthresh=4,decimate]",
-                            order)
-                    elseif status == "interlaced" then
-                        setup = "Interlaced: bwdif"
-                        vf = string.format(
-                            "lavfi=[bwdif=mode=1:parity=%s:deint=interlaced]",
-                            order)
-                    elseif status == "mix_telecine" then
-                        setup = "Mixed telecine: fieldmatch + bwdif + decimate"
-                        vf = string.format(
-                            "lavfi=[fieldmatch=order=%s:mode=pcn_ub:combmatch=full:cthresh=4,bwdif=mode=0:parity=%s:deint=interlaced,decimate]",
-                            order, order)
-                    elseif status == "mix_interlaced" then
-                        -- No reliable pulldown signature: deinterlace only frames
-                        -- marked interlaced; do not decimate genuine unique frames.
-                        setup = "Mixed interlace: bwdif only"
-                        vf = string.format(
-                            "lavfi=[bwdif=mode=0:parity=%s:deint=interlaced]",
-                            order)
-                    elseif status == "soft_telecine" then
-                        setup = "Soft telecine (no filter)"
-                    elseif status == "unknown" then
-                        setup = "Unknown (no filter)"
-                    end
-
-                    local order_text = normalize_order(raw_order)
-                    order_text = order_text and string.upper(order_text) or "AUTO / unknown"
-                    local report = string.format(
-                        "—— VSPROCESS DYNAMIC DEINT ——\n──────────────────────────────\n● Detected Cadence:  %s\n● Field Order:       %s\n● Applied Setup:     %s\n──────────────────────────────\n[Frame Structure]\n  ├─ Interlaced:  %.1f%%\n  └─ Progressive: %.1f%%\n[Cadence Signature]\n  └─ Repeat Field Ratio: %.1f%%\n──────────────────────────────",
-                        status, order_text, setup,
-                        interlaced * 100, progressive * 100, repeat_ratio * 100)
-
-                    -- Keep the existing mpv.conf contract: both mixed subtypes
-                    -- publish "mix", while the OSD retains the precise diagnosis.
-                    local state_status = status:match("^mix") and "mix" or status
-                    apply_cadence(vf, state_status)
-                    cached_result = {
-                        path = path, status = state_status, vf = vf, text = report,
-                    }
-                    show(report, 8, is_auto)
-                end
-            end
+        if not (ok and res and res.status == 0) then
+            msg.warn("vsdetect failed: " .. tostring(res and res.stderr))
+            return show("Scan failed", 3, auto)
         end
+        local scan = parse_scan(res.stdout or "")
+        if not scan then return show("Invalid vsdetect output", 3, auto) end
 
-        local pending = pending_scan
-        pending_scan = nil
-        if pending and pending.epoch == file_epoch
-            and mp.get_property("path") == pending.path then
-            run_cadence_scan(pending.auto)
+        if not override_name() then apply_scan(scan) end
+        file_entry.scan = scan
+        save_entry()
+
+        if not auto then
+            show(build_report(scan), 8)
+        elseif opts.auto_scan_osd then
+            show("Deint: " .. setup_text(scan), 3)
         end
     end)
+    scan_token = token
 end
 
+--------------------------------------------------------------------------
+-- Events and keys
+--------------------------------------------------------------------------
 mp.register_event("file-loaded", function()
-    file_epoch = file_epoch + 1
-    apply_cadence("", "progressive")
+    file_id = identity_for(mp.get_property("path", ""))
+    file_entry = file_id and read_entry(file_id) or {}
 
+    -- A per-file manual override wins, so one file's pick never leaks into
+    -- the next.
+    forced = file_entry.override or default_forced
+
+    active_vf = false  -- unsynced: force one sweep of leftover filters
+    if settle() then return end
+
+    -- file_id is nil for anything vsdetect can't read (http streams etc.), so
+    -- those never spawn a doomed scan. x still tries one manually.
     local height = mp.get_property_number("height", 0)
-    if opts.auto_scan_sd and height > 0 and height <= 576 then
+    if opts.auto_scan_sd and file_id and height > 0 and height <= 576 then
         run_cadence_scan(true)
     end
 end)
 
-mp.register_event("end-file", function()
-    file_epoch = file_epoch + 1
-    pending_scan = nil
+mp.register_event("end-file", function(e)
+    if scan_token then
+        mp.abort_async_command(scan_token)
+        scan_token = nil
+    end
+    if e.reason == "quit" then return end  -- nothing to tidy on the way out
     show("", 0)
-    apply_cadence("", "progressive")
-    cached_result = nil
+    apply(nil)
+    file_id, file_entry = nil, {}
 end)
 
-mp.add_key_binding("x", "probe_cadence", function()
-    if osd_visible then
+mp.add_key_binding("d", "probe_cadence", function()
+    if mp.get_time() < osd_until then
         show("", 0)
     else
         run_cadence_scan(false)
     end
+end)
+
+mp.add_key_binding("Ctrl+d", "rescan_cadence", function()
+    run_cadence_scan(false, true)
+end)
+
+mp.add_key_binding("D", "cycle_chain", function()
+    local i = 1
+    for n, id in ipairs(CYCLE) do
+        if id == forced then i = n end
+    end
+    forced = CYCLE[i % #CYCLE + 1]
+
+    -- Remembered per file ("auto" just clears the override).
+    file_entry.override = forced ~= "auto" and forced or nil
+    save_entry()
+
+    -- "auto" means what it does at load time: saved scan, else a fresh scan.
+    if not settle() then run_cadence_scan(false) end
+    show("Deint chain: " .. CHAINS[forced].label, 3)
 end)

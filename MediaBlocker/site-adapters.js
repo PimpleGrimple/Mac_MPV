@@ -29,6 +29,7 @@
   const KVS_NAME_RE = /\/(\d+)(?:_\d{3,4}p?)?(\.(?:mp4|m4v|webm))(\/?)$/i;
   const KVS_ANY_RE  = /https?:\/\/[^\s"'<>\\]+\/get_file\/[^\s"'<>\\]+/g;
   const SCAN_TTL_MS = 3000;
+  const MAX_SCANNED = 500;                                  // URLs kept per page scan
 
   function kvsParse(url) {
     let path;
@@ -58,11 +59,12 @@
       add(el.getAttribute('href')); add(el.getAttribute('src')); add(el.getAttribute('data-src'));
     });
     document.querySelectorAll('script:not([src])').forEach(sc => {
+      if (found.length >= MAX_SCANNED) return;
       const text = (sc.textContent || '').replace(/\\\//g, '/').replace(/\\u0026/g, '&');
       if (text.indexOf('/get_file/') === -1) return;
       (text.match(KVS_ANY_RE) || []).forEach(add);
     });
-    return found;
+    return found.slice(0, MAX_SCANNED);
   }
 
   // Pure core (also what the tests exercise). Real links of this file id (the captured one
@@ -113,6 +115,7 @@
         let hit = cache.get(me.id);
         if (!hit || Date.now() - hit.t > SCAN_TTL_MS) {
           hit = { t: Date.now(), urls: scanPageForKvs() };
+          if (cache.size >= 20) cache.delete(cache.keys().next().value);
           cache.set(me.id, hit);
         }
         return kvsVariants(url, hit.urls, opts.ladder);

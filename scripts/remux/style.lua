@@ -3,7 +3,8 @@
 
   main.lua hands this module plain data ("view models") and gets ASS markup back.
   Nothing in here knows about tracks, ffmpeg or mpv state, so you can restyle the
-  menu freely without touching the logic.
+  menu freely without touching the logic. main.lua reads the options (M.defaults) and
+  hands them over with M.configure(opts); this module reads no confs.
 
   M.menu(vm, sel, first) -> { ass, res_x, res_y, first, box, hits }
       vm = { title, subtitle, badge, items = {...}, issues = {...}, toast, toast_tone }
@@ -24,11 +25,16 @@
       gap
   tone is one of nil | "dim" | "ok" | "warn" | "bad" | "accent".
 
-  Look: follows your shared `menu-*` script-opts (accent_color, bg_color, bg_alpha,
-  border_color, border_alpha, text_color, desc_color, font, blur, anchor, margin,
-  text_border_color), plus remux.conf: width, anchor, bg_alpha
-  (bg_alpha is its own setting, not shared: hex 00-FF, 00 = solid, FF = invisible, default 14,
-  which is about 92% opaque; try 30-50 for a more see-through card).
+  Look: remux has its own look options, separate from the simple menu (autosubsync/style.lua).
+  They are the `defaults` table below, read from script-opts/remux.conf or `remux-<option>`
+  script-opts (so style profiles can set them), and applied live:
+      width anchor margin font radius pill_radius outline
+      accent_color accent_text_color bg_color bg_alpha border_color border_alpha
+      text_color desc_color text_border_color ok_color warn_color bad_color
+  Colours are RGB hex ("9b5de5"); alphas are ASS alpha hex (00 solid ... FF invisible).
+  bg_alpha 14 is about 92% opaque; try 30-50 for a more see-through card.
+  accent_text_color is the text/tick drawn ON the accent fill (Export button, checkboxes):
+  white on dark accents, dark on light ones.
 ]]
 
 local mp = require "mp"
@@ -36,46 +42,40 @@ local mp = require "mp"
 local M = {}
 
 ---------------------------------------------------------------------------
--- Options (set by main.lua via M.configure; this module reads no conf files)
+-- Options (defaults live here; main.lua reads remux.conf / remux-* script-opts into them)
 ---------------------------------------------------------------------------
 
-local shared = {
-    accent_color = "9b5de5", bg_color = "111111",
+M.defaults = {
+    width = 680, anchor = "top-right", margin = 30,
+    font = "",                          -- empty = the OSD font
+    radius = 14, pill_radius = 9,       -- card / highlight corner radius
+    outline = 0.7,                      -- text outline width (keeps text readable over bright video)
+    accent_color = "9b5de5", accent_text_color = "ffffff",
+    bg_color = "111111", bg_alpha = "14",
     border_color = "d4baff", border_alpha = "78",
-    text_color = "f2f2f2", desc_color = "9a9a9a",
-    text_border_color = "111111",
-    font = "", blur = 12, anchor = "top-right", margin = 30,
+    text_color = "f2f2f2", desc_color = "9a9a9a", text_border_color = "111111",
+    ok_color = "4ADE80", warn_color = "F5A524", bad_color = "F87171",
 }
 
--- bg_alpha is deliberately NOT taken from the shared menu-* opts: those change with your style
--- profiles and can make this card solid. Set it in remux.conf instead
--- (hex 00-FF: 00 solid, FF invisible).
-local own = { width = 680, anchor = "", bg_alpha = "14" }
+local L = {}
+for key, value in pairs(M.defaults) do L[key] = value end
+local TONE = { ok = L.ok_color, warn = L.warn_color, bad = L.bad_color }
 
--- Called by main.lua once its options are read. `menu_opts` is the shared menu
--- look (menu.conf / menu-* script-opts); `remux_opts` is its remux table.
-function M.configure(menu_opts, remux_opts)
-    for key, value in pairs(menu_opts or {}) do
-        if shared[key] ~= nil then shared[key] = value end
+-- Called by main.lua with its option table whenever options are (re)read.
+function M.configure(opts)
+    for key in pairs(M.defaults) do
+        if opts[key] ~= nil then L[key] = opts[key] end
     end
-    own.width = remux_opts.width or own.width
-    own.anchor = remux_opts.anchor or ""
-    own.bg_alpha = remux_opts.bg_alpha or own.bg_alpha
-    if own.anchor ~= "" then shared.anchor = own.anchor end
-    shared.bg_alpha = own.bg_alpha
+    if L.anchor == "" then L.anchor = M.defaults.anchor end
+    TONE.ok, TONE.warn, TONE.bad = L.ok_color, L.warn_color, L.bad_color
 end
-
-local L = shared
-local TONE = { ok = "4ADE80", warn = "F5A524", bad = "F87171" }
 
 ---------------------------------------------------------------------------
 -- Metrics (the canvas is always 720 high, like your other menus)
 ---------------------------------------------------------------------------
 
-local OUTLINE = 0.7     -- text outline width (keeps text readable over bright video)
 local PAD = 18          -- card padding
 local INNER = 8         -- extra inset of row content inside the padding
-local R_CARD, R_PILL = 14, 9
 local H = { section = 30, track = 40, button = 54, action = 38, value = 38, choice = 38, info = 26, gap = 14 }
 
 local function row_h(it) return H[it.kind] or H.action end
@@ -196,7 +196,7 @@ local function text(a, x, y, s, o)
     local clip = o.clip and string.format("\\clip(%d,%d,%d,%d)", o.clip[1], o.clip[2], o.clip[3], o.clip[4]) or ""
     push(a, string.format("{\\an%d\\pos(%d,%d)%s\\fs%d\\b%d\\i%d\\fsp%s\\shad0\\bord%s\\3c&H%s&\\1c&H%s&\\1a&H%s&\\3a&H%s&\\blur0%s}%s",
         o.an or 4, n(x), n(y), L.font ~= "" and ("\\fn" .. L.font) or "", n(o.size or 17), o.bold and 1 or 0,
-        o.italic and 1 or 0, o.spacing or 0, OUTLINE, rgb2ass(L.text_border_color),
+        o.italic and 1 or 0, o.spacing or 0, L.outline, rgb2ass(L.text_border_color),
         rgb2ass(o.color or L.text_color), o.alpha or "00", o.alpha or "00", clip, o.raw and s or esc(s)))
 end
 
@@ -241,8 +241,8 @@ local function card_bg(a, x, y, w, h)
     -- Drawn the plain way on purpose: a solid fill with only its own alpha, and the border as a
     -- separate thin ring. (No blur, no drop shadow, no stroke on the fill: those rendered as solid
     -- black underneath the card in mpv and made it look opaque however low bg_alpha was set.)
-    rect(a, x, y, w, h, R_CARD, { fill = L.bg_color, fa = L.bg_alpha })
-    shape(a, ring_path(x, y, w, h, R_CARD, 1), { fill = L.border_color, fa = L.border_alpha })
+    rect(a, x, y, w, h, L.radius, { fill = L.bg_color, fa = L.bg_alpha })
+    shape(a, ring_path(x, y, w, h, L.radius, 1), { fill = L.border_color, fa = L.border_alpha })
 end
 
 local function divider(a, x, y, w)
@@ -255,11 +255,11 @@ end
 
 local function draw_pill(a, rx, ry, rw, rh, strong, grabbed)
     if grabbed then
-        rect(a, rx + 2, ry + 2, rw - 4, rh - 4, R_PILL,
+        rect(a, rx + 2, ry + 2, rw - 4, rh - 4, L.pill_radius,
             { fill = L.accent_color, fa = "48", stroke = "FFFFFF", sa = "28", sw = 1.6 })
         return
     end
-    rect(a, rx + 2, ry + 2, rw - 4, rh - 4, R_PILL,
+    rect(a, rx + 2, ry + 2, rw - 4, rh - 4, L.pill_radius,
         { fill = L.accent_color, fa = strong and "78" or "98", stroke = L.accent_color, sa = "30", sw = 1 })
 end
 
@@ -287,7 +287,7 @@ local function draw_track(a, it, rx, ry, rw, selected)
     if it.on then
         local box = it.tone == "bad" and TONE.bad or it.tone == "warn" and TONE.warn or L.accent_color
         rect(a, bx, mid - bs / 2, bs, bs, 4, { fill = box })
-        shape(a, check_path(bx, mid - bs / 2, bs), { fill = "FFFFFF" })
+        shape(a, check_path(bx, mid - bs / 2, bs), { fill = L.accent_text_color })
     else
         rect(a, bx + 1, mid - bs / 2 + 1, bs - 2, bs - 2, 3, { fill = "000000", fa = "FF", stroke = L.desc_color, sa = "40", sw = 1.4 })
     end
@@ -340,13 +340,13 @@ local function draw_button(a, it, rx, ry, rw, selected)
         stroke = selected and "FFFFFF" or (bad and TONE.bad or L.border_color), sa = selected and "20" or "60", sw = selected and 1.6 or 1 })
     local mid = ry + H.button / 2 - 1
     local ix = rx + INNER + 8
-    text(a, ix, mid, it.text, { size = 19, bold = true, color = bad and TONE.bad or "FFFFFF" })
+    text(a, ix, mid, it.text, { size = 19, bold = true, color = bad and TONE.bad or L.accent_text_color })
     local detail_x = rx + rw - INNER - (it.chevron and 28 or 12)
     if it.detail and it.detail ~= "" then
-        text(a, detail_x, mid, cut(it.detail, 34), { size = 13, an = 6, color = bad and "F3B4B4" or "E9DDFB", alpha = "10",
+        text(a, detail_x, mid, cut(it.detail, 34), { size = 13, an = 6, color = bad and "F3B4B4" or L.accent_text_color, alpha = bad and "10" or "30",
             clip = { ix + 150, ry, detail_x, ry + H.button } })
     end
-    if it.chevron then shape(a, chevron_path(rx + rw - INNER - 10, mid - 5), { fill = "FFFFFF", fa = "30" }) end
+    if it.chevron then shape(a, chevron_path(rx + rw - INNER - 10, mid - 5), { fill = bad and "FFFFFF" or L.accent_text_color, fa = "30" }) end
 end
 
 local function draw_line_item(a, it, rx, ry, rw, selected)
@@ -391,7 +391,7 @@ end
 
 function M.menu(vm, sel, first)
     local cw, ch = canvas()
-    local W = math.min(own.width, cw - 2 * L.margin)
+    local W = math.min(L.width, cw - 2 * L.margin)
     local items = vm.items
 
     -- footer lines: the toast first, then problems
@@ -439,7 +439,7 @@ function M.menu(vm, sel, first)
 
     -- header
     local hy = y + PAD
-    text(a, rx + INNER + 8, hy + (vm.subtitle and 14 or 20), vm.title, { size = 21, bold = true, color = "FFFFFF" })
+    text(a, rx + INNER + 8, hy + (vm.subtitle and 14 or 20), vm.title, { size = 21, bold = true, color = L.text_color })
     if vm.subtitle then
         text(a, rx + INNER + 8, hy + 38, cut(vm.subtitle, 70), { size = 13, color = L.desc_color,
             clip = { rx + INNER + 8, hy, rx + rw - INNER - 90, hy + head_h } })
@@ -522,7 +522,7 @@ function M.card(c)
     card_bg(a, x, y, W, Hc)
     text(a, ix, y + 26, c.title, { size = 13, bold = true, color = col, spacing = 1.5 })
     if c.hint then text(a, ix + iw, y + 26, c.hint, { size = 13, an = 6, color = L.desc_color }) end
-    text(a, ix, y + 52, cut(c.sub or "", 40), { size = 18, bold = true, color = "FFFFFF", clip = { ix, y, ix + iw, y + Hc } })
+    text(a, ix, y + 52, cut(c.sub or "", 40), { size = 18, bold = true, color = L.text_color, clip = { ix, y, ix + iw, y + Hc } })
     if c.pct then
         rect(a, ix, y + 74, iw, 6, 3, { fill = "FFFFFF", fa = "D8" })
         if iw * c.pct >= 6 then rect(a, ix, y + 74, iw * c.pct, 6, 3, { fill = col }) end

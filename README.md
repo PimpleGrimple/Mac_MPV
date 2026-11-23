@@ -5,29 +5,17 @@
 
 ## Table of Contents
 
-1. [Custom MPV Development Build (`mpv.zip`)](#1-custom-mpv-development-build-mpvzip)
-2. [System Dependencies](#2-system-dependencies)
-3. [Installation & Setup](#3-installation--setup)
-4. [MPV Launcher (`mpv-launcher.py`) & System Integration](#4-mpv-launcher-mpv-launcherpy--system-integration)
-5. [Browser Extension & Native Messaging](#5-browser-extension--native-messaging)
-6. [Scripts & Automation Suite](#6-scripts--automation-suite)
-7. [Credits & References](#7-credits--references)
-8. [License](#8-license)
+1. [System Dependencies](#1-system-dependencies)
+2. [Installation & Setup](#2-installation--setup)
+3. [MPV Launcher (`mpv-launcher.py`) & System Integration](#3-mpv-launcher-mpv-launcherpy--system-integration)
+4. [Browser Extension & Native Messaging](#4-browser-extension--native-messaging)
+5. [Scripts & Automation Suite](#5-scripts--automation-suite)
+6. [Credits & References](#6-credits--references)
+7. [License](#7-license)
 
 ---
 
-## 1. Custom MPV Development Build (`mpv.zip`)
-
-Custom development build compiled with the following flags and integrations:
-- **Base Version**: `mpv master` (commit `g82667e3cb-dirty`, version report `0.41.0-dev`).
-- **libplacebo Version**: `v7.373.0` (Metal backend fork with `gpu-api=metal`, Vulkan, LCMS2, and SDR-to-HDR ITM desaturation patch).
-- **Integrated Disc Support**: Linked with `libbluray`, `dvdnav`, and `dvda` for native Blu-ray and DVD playback.
-- **VapourSynth Integration**: Dynamic runtime bridge (`--vf=vapoursynth`) linked against modern VapourSynth.
-- **CoreAudio Fix**: Channel-map fix (commit `a9a9e5e`) applied to `audio/out/ao_coreaudio.c`.
-- **Packaging**: Self-contained `.app` bundle with internal dynamic library paths re-linked (`install_name_tool`) and embedded MoltenVK ICD manifest.
-
----
-## 2. System Dependencies
+## 1. System Dependencies
 
 ### Homebrew Packages
 ```bash
@@ -52,18 +40,18 @@ brew install yt-dlp ffmpeg deno alass subliminal mkvtoolnix
 
 ---
 
-## 3. Installation & Setup
+## 2. Installation & Setup
 
 1. **Clone the Configuration**:
    ```bash
    git clone https://github.com/PimpleGrimple/Mac_MPV.git ~/.config/mpv
-   chmod +x ~/.config/mpv/mpv-launcher.py
+   chmod +x ~/.config/mpv/MediaBlocker/mpv-launcher.py
    ```
 
 2. **Install MPV App**:
-   Unpack `mpv.zip` into `/Applications` (or `~/Applications`):
+   Install MPV via Homebrew or place `mpv.app` into `/Applications`:
    ```bash
-   unzip -q ~/.config/mpv/mpv.zip -d /Applications/
+   brew install --cask mpv
    ```
 
 3. **Install Fonts**:
@@ -71,7 +59,7 @@ brew install yt-dlp ffmpeg deno alass subliminal mkvtoolnix
    ```bash
    unzip -o ~/.config/mpv/fonts.zip -d ~/.config/mpv/
    ```
-   Install `fluent-system-icons.ttf`, `Segoe UI Semibold.ttf`, and `AOTFShinGoProMedium.otf` from `~/.config/mpv/fonts/`.
+   Install `fluent-system-icons.ttf`, `Segoe UI Semibold.ttf`, `AOTFShinGoProMedium.otf`, and accompanying fonts from `~/.config/mpv/fonts/`.
 
 4. **Directory Setup & Aliases**:
    Create screenshot/config folders and symlinks:
@@ -112,11 +100,11 @@ brew install yt-dlp ffmpeg deno alass subliminal mkvtoolnix
    ```
 
 6. **Set Up macOS Quick Action / Keybind**:
-   Create the Automator Quick Action(s) as documented in [Section 4](#4-mpv-launcher-mpv-launcherpy--system-integration) and assign hotkeys in **System Settings** → **Keyboard** → **Keyboard Shortcuts...** → **Services** → **General**.
+   Create the Automator Quick Action(s) as documented in [Section 3](#3-mpv-launcher-mpv-launcherpy--system-integration) and assign hotkeys in **System Settings** → **Keyboard** → **Keyboard Shortcuts...** → **Services** → **General**.
 
 ---
 
-## 4. MPV Launcher (`mpv-launcher.py`) & System Integration
+## 3. MPV Launcher (`mpv-launcher.py`) & System Integration
 
 `mpv-launcher.py` handles application launching (`open -n -b io.mpv`), single-instance IPC queuing (`~/.config/mpv/cache/fallback.sock`), optical disc mounting, and browser native messaging.
 
@@ -128,7 +116,7 @@ You can set up either (or both) of these Quick Actions in **Automator.app**:
   - In Automator: create a **Quick Action**, set workflow receives **no input** in **any application**.
   - Add **Run Shell Script** (`/bin/zsh`):
     ```zsh
-    $HOME/.config/mpv/mpv-launcher.py
+    $HOME/.config/mpv/MediaBlocker/mpv-launcher.py
     ```
   - **Behavior**: Checks highlighted items in Finder, or falls back to playing clipboard URLs/paths via macOS `pbpaste`.  
   - *Trade-off*: Can occasionally be inconsistent at reading Finder selection, and will not appear in Finder's right-click context menu.
@@ -137,7 +125,7 @@ You can set up either (or both) of these Quick Actions in **Automator.app**:
   - In Automator: create a **Quick Action**, set workflow receives **files or folders** in **Finder.app**.
   - Add **Run Shell Script** (`/bin/zsh`, pass input **as arguments**):
     ```zsh
-    "$HOME/.config/mpv/mpv-launcher.py" "$@"
+    "$HOME/.config/mpv/MediaBlocker/mpv-launcher.py" "$@"
     ```
   - **Behavior**: Appears directly in Finder's right-click menu (**Quick Actions** → **MPV**) and reliably opens the selected files/folders.  
   - *Trade-off*: Disables the clipboard fallback function because input is strictly bound to selected files.
@@ -149,7 +137,7 @@ Folders containing `VIDEO_TS` or `BDMV` are automatically mounted via `--dvd-dev
 
 ---
 
-## 5. Browser Extension & Native Messaging
+## 4. Browser Extension & Native Messaging
 
 * **Media Blocker (`MediaBlocker/`)**: Unpacked Manifest V3 extension in `~/.config/mpv/MediaBlocker/` (merges stream detection and Play in MPV into one extension).
   - Intercepts stream requests (`.m3u8`, `.mpd`, `.mp4`) before web players load. Provides quality/bitrate selection, codec inspection (AV1, HEVC, VP9, H.264), direct stream playback, and `#MBSTREAM` payload copying.
@@ -168,7 +156,7 @@ cat << EOF > ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/c
 {
   "name": "com.playinmpv.host",
   "description": "MPV Launcher Native Messaging Host",
-  "path": "$HOME/.config/mpv/mpv-launcher.py",
+  "path": "$HOME/.config/mpv/MediaBlocker/mpv-launcher.py",
   "type": "stdio",
   "allowed_origins": [
     "chrome-extension://jejmniblnialndgjpkpfammnohfgljdi/"
@@ -181,17 +169,17 @@ EOF
 
 ---
 
-## 6. Scripts & Automation Suite
+## 5. Scripts & Automation Suite
 
 * **deint.lua**:
-  - Bound to `x`. Runs cadence analysis via `vsdetect` to detect progressive/interlaced video, 3:2 pulldown, and field order.
-  - Automatically applies the best mpv filters and shaders to deinterlace.
+  - Bound to `D` (cycle deinterlace chain: auto, telecine, bob, mix, hybrid, off) and `Ctrl+d` (rescan cadence). Runs cadence analysis via `vsdetect` to detect progressive/interlaced video, 3:2 pulldown, and field order.
+  - Automatically applies the best mpv filters and chains to deinterlace.
 * **smartcut**:
   - Frame-accurate lossless cutter. Re-encodes only GOP-boundary edges with CRF 10 and stream-copies intermediate frames.
   - `k`: Mark A / Mark B → trigger background cut | `K`: Cycle modes (`smartcut`, `compress`, `pansmash`, `gif`) | `` ` `` (backtick): Process console.
 * **remux**:
   - Lossless remuxing and track manager via `ffmpeg -c copy`. Reorders and toggles video, audio, and subtitle tracks, delays, chapters, and font attachments.
-  - `Ctrl+R`: Toggle menu | `Ctrl+Alt+r`: Immediate export.
+  - `Ctrl+R`: Export / toggle menu.
 * **auto_skip**:
   Consolidates all segment skipping into one engine:
   - **aniskip.lua**: Skips anime opening and ending sequences via the AniSkip API (`Alt+s` / `ENTER`).
@@ -212,7 +200,7 @@ EOF
 * **autosubsync**: Voice-activity subtitle synchronization against audio track via `alass` (`n`).
 * **sub_pause.lua**: Auto-pause at start of subtitle (`"`), auto-pause at end of subtitle (`'`), jump to next subtitle line (`;`), replay line (`l`).
 * **sub_skip.lua**: Auto-skip or speed-up gaps between subtitle lines (`\` toggle, `|` switch speed/seek mode).
-* **styles.lua**: Interactive on-screen menu (`g-u`), forward (`u`), backward (`U`), reset default (`g-U`) for cycling custom subtitle font styles and appearance presets defined in `styles.conf`.
+* **styles.lua**: Interactive on-screen menu (`g-u`), forward (`u`), backward (`U`), reset default (`Ctrl+u` / `g-U`) for cycling custom subtitle font styles and appearance presets defined in `styles.conf`.
 * **chapter_maker.lua**:
   - Interactive chapter creation, splitting, A-B loop conversion, renaming, and MKV embedding via `mkvpropedit`.
   - `c`: Split chapter | `Alt+m`: Mark A-B chapter | `Alt+r`: Rename chapter | `Alt+d`: Remove chapter | `Alt+z`: Undo | `Alt+e`: Export sidecar | `Alt+w`: Embed into MKV.
@@ -225,14 +213,16 @@ EOF
 * **pip.lua**: Toggles borderless, aspect-locked floating window (`Alt+p` / `π`).
 * **auto_save.lua**: Persists playback position, selected audio track, and subtitle track across sessions.
 * **cookie_cache.lua**: Extracts and caches browser cookies for yt-dlp playback.
+* **keybind-visualizer.lua**: Interactive on-screen keyboard map (`3` / `F6`). Displays all active keybindings and modifier combinations (`Ctrl+`, `Shift+`, `Alt+`, `Meta+`) read live from `input.conf`. Hover over any key to inspect its bindings, or type directly into the search bar to filter by key name, modifier, command, or description.
 
 ---
 
-## 7. Credits & References
+## 6. Credits & References
 
 - **Base Setup**: [zydezu/mpvconfig](https://github.com/zydezu/mpvconfig)
 - **Shaders, Profiles & LUTs**: [hooke007/mpv_PlayKit](https://github.com/hooke007/mpv_PlayKit)
 - **Shaders, Profiles**: [he2a/mpv-config](https://github.com/he2a/mpv-config)
+- **Scripts, Profiles & Layouts**: [v-amorim/moonlight-mpv](https://github.com/v-amorim/moonlight-mpv)
 - **AltScale**: [garamond13/AltScale](https://github.com/garamond13/AltScale)
 - **libplacebo Metal Fork**: [ab300819/libplacebo (metal-backend)](https://github.com/ab300819/libplacebo/tree/metal-backend)
 - **The Stream Detector**: [54ac/stream-detector](https://github.com/54ac/stream-detector) (stream detection basis for Media Blocker)
@@ -249,6 +239,6 @@ EOF
 
 ---
 
-## 8. License
+## 7. License
 
-This configuration, custom scripts, and extensions (`MediaBlocker`, `mpv-launcher.py`, build scripts) are licensed under the [MIT License](LICENSE). Third-party scripts, shaders, and tools remain licensed under their respective original terms.
+This configuration, custom scripts, and extensions are licensed under the [MIT License](LICENSE). Third-party scripts, shaders, and tools remain licensed under their respective original terms.

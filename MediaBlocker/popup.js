@@ -11,7 +11,7 @@ function isVersionOutdated(hostVersion, minVersion) {
   // A custom host that doesn't report a version is assumed fine; only warn when
   // a version is reported and it's older than the minimum.
   if (!hostVersion) return false;
-  const parts1 = hostVersion.split('.').map(Number);
+  const parts1 = String(hostVersion).split('.').map(Number);
   const parts2 = minVersion.split('.').map(Number);
   for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
     const val1 = parts1[i] || 0;
@@ -174,24 +174,51 @@ async function initPlayCurrentTab() {
 /**
  * Helper to update the system warning banner content and visibility based on requirements check.
  */
+const SETUP_GUIDE_URL = 'https://franciscobecheli.github.io/play-in-mpv/';
+
+// Parts are plain strings or [tag, text] pairs; everything goes in as text nodes, so nothing
+// from the host's reply can ever be parsed as HTML.
+function setBanner(parts, linkText) {
+  const box = elements.warningBannerText;
+  box.textContent = '';
+  for (const part of parts) {
+    if (typeof part === 'string') { box.appendChild(document.createTextNode(part)); continue; }
+    const node = document.createElement(part[0]);
+    node.textContent = part[1];
+    box.appendChild(node);
+  }
+  const a = document.createElement('a');
+  a.href = SETUP_GUIDE_URL;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  a.style.cssText = 'color: #60a5fa; text-decoration: underline; font-weight: 500;';
+  a.textContent = linkText;
+  box.appendChild(document.createTextNode(' '));
+  box.appendChild(a);
+  elements.ytdlWarningBanner.classList.remove('hidden');
+}
+
 function updateWarningBanner(ytdlMissing, mpvMissing, hostMissing = false, hostOutdated = false, hostVersion = '') {
   if (hostMissing) {
-    elements.ytdlWarningBanner.classList.remove('hidden');
-    elements.warningBannerText.innerHTML = '<strong>Native Host Not Connected:</strong> The local bridge is missing or failed to connect. <a href="https://franciscobecheli.github.io/play-in-mpv/" target="_blank" style="color: #60a5fa; text-decoration: underline; font-weight: 500;">Download & Install Setup Guide</a>';
+    setBanner([['strong', 'Native Host Not Connected:'], ' The local bridge is missing or failed to connect.'],
+      'Download & Install Setup Guide');
   } else if (hostOutdated) {
-    elements.ytdlWarningBanner.classList.remove('hidden');
-    elements.warningBannerText.innerHTML = `<strong>Outdated Host Bridge:</strong> Your local bridge (v${hostVersion || 'unknown'}) is outdated. Please update and run the installer for version ${MIN_HOST_VERSION}. <a href="https://franciscobecheli.github.io/play-in-mpv/" target="_blank" style="color: #60a5fa; text-decoration: underline; font-weight: 500;">Setup Guide & Installer</a>`;
+    const v = String(hostVersion || 'unknown').slice(0, 24);
+    setBanner([['strong', 'Outdated Host Bridge:'],
+      ` Your local bridge (v${v}) is outdated. Please update and run the installer for version ${MIN_HOST_VERSION}.`],
+      'Setup Guide & Installer');
   } else if (ytdlMissing || mpvMissing) {
-    elements.ytdlWarningBanner.classList.remove('hidden');
-    let msg = '';
-    if (ytdlMissing && mpvMissing) {
-      msg = 'Both <code>mpv</code> and <code>yt-dlp</code> were not found on your system <strong>PATH</strong>.';
-    } else if (ytdlMissing) {
-      msg = '<code>yt-dlp</code> was not found on your system <strong>PATH</strong>.';
-    } else {
-      msg = '<code>mpv</code> was not found on your system <strong>PATH</strong> (or custom settings path).';
-    }
-    elements.warningBannerText.innerHTML = `<strong>System Warning:</strong> ${msg} This is required for the extension to work. <a href="https://franciscobecheli.github.io/play-in-mpv/" target="_blank" style="color: #60a5fa; text-decoration: underline; font-weight: 500;">Setup Guide & PATH Instructions</a>`;
+    const what = ytdlMissing && mpvMissing
+      ? [' Both ', ['code', 'mpv'], ' and ', ['code', 'yt-dlp'], ' were not found on your system ']
+      : ytdlMissing
+        ? [['code', 'yt-dlp'], ' was not found on your system ']
+        : [['code', 'mpv'], ' was not found on your system '];
+    const tail = !ytdlMissing || !mpvMissing
+      ? (ytdlMissing ? '.' : ' (or custom settings path).')
+      : '.';
+    setBanner([['strong', 'System Warning:'], ...(ytdlMissing && mpvMissing ? what : [' ', ...what]),
+      ['strong', 'PATH'], tail + ' This is required for the extension to work.'],
+      'Setup Guide & PATH Instructions');
   } else {
     elements.ytdlWarningBanner.classList.add('hidden');
   }
@@ -447,8 +474,18 @@ async function saveSettings() {
     showToast('Settings saved');
   } catch (err) {
     console.error('[Play in MPV] Failed to save settings:', err);
+    showToast('Could not save settings', true);
   }
 }
+
+// The popup is destroyed the moment it loses focus: a custom-flags edit still waiting on its
+// 350ms debounce would be lost, so write it out as the popup goes away.
+window.addEventListener('pagehide', () => {
+  if (!saveDebounceTimer) return;
+  clearTimeout(saveDebounceTimer);
+  saveDebounceTimer = null;
+  chrome.storage.local.set({ customFlags: elements.customFlags.value });
+});
 
 /**
  * Setup event listeners for inputs

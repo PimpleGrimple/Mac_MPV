@@ -2,6 +2,9 @@
 --   * it is defined in ~~/styles.conf (any name; pulled in from mpv.conf with  include=~~/styles.conf), OR
 --   * its name starts with "style-" (see style_prefix) wherever it is defined, e.g. directly in mpv.conf.
 --
+-- The picker is drawn by that same menu and styled like the autosubsync menu: its look options are
+-- autosubsync.conf / autosubsync-<option> script-opts (the profiles in styles.conf set them per style).
+--
 --   [example]
 --   profile-desc="Clean (white, bold)"      # "Name (description)" -> shown as name + dim description
 --   sub-font="Helvetica Neue"
@@ -12,8 +15,8 @@ local utils = require("mp.utils")
 local options = require("mp.options")
 local msg = require("mp.msg")
 
-package.path = mp.command_native({ "expand-path", "~~/scripts/autosubsync" }) .. "/?.lua;" .. package.path
-local Menu = require("menu_style")
+-- The menu is the simple list menu that lives in autosubsync's folder: one shared copy, pointed at here.
+local MENU_FILE = "~~/scripts/autosubsync/style.lua"
 
 local CONFIG = {
     styles_file = "~~/styles.conf",
@@ -34,6 +37,20 @@ local function is_list_key(key)
         if key:sub(-#suffix) == suffix then return true end
     end
     return false
+end
+
+local Menu, menu_error
+do
+    local path = mp.command_native({ "expand-path", MENU_FILE })
+    local chunk, err = loadfile(path)
+    if chunk then
+        local ok, result = pcall(chunk)
+        if ok and type(result) == "table" then Menu = result else err = result end
+    end
+    if not Menu then
+        menu_error = "styles: cannot load " .. MENU_FILE .. " - " .. tostring(err)
+        msg.error(menu_error)
+    end
 end
 
 local styles = {}
@@ -201,10 +218,10 @@ local function load_saved_index()
     return 1
 end
 
--- modernx's own show_osc key binding (only exists when modernx has key_bindings=yes, its default).
--- If you don't use modernx, set show_osc=false in styles.conf or delete this function + its 3 call sites.
+-- Flash uosc controls while browsing subtitle styles.
+-- If you don't use uosc, set show_osc=false in script-opts/styles.conf.
 local function show_ui()
-    if CONFIG.show_osc then mp.commandv("script-binding", "modernx/show_osc") end
+    if CONFIG.show_osc then mp.commandv("script-binding", "uosc/flash-ui") end
 end
 
 local function select_style(index)
@@ -240,6 +257,10 @@ local function toggle_menu()
         menu:cancel()
         return
     end
+    if not Menu then
+        mp.osd_message(menu_error, 6)
+        return
+    end
     if #styles <= (CONFIG.default_entry and 1 or 0) then
         mp.osd_message(problem or string.format("No styles found - put profiles in %s, or name them \"%s...\" in mpv.conf",
             CONFIG.styles_file, CONFIG.style_prefix), 5)
@@ -252,7 +273,7 @@ local function toggle_menu()
     end
     local previewed = active
 
-    menu = Menu:new({ items = items, active = active })
+    menu = Menu:new({ items = items, active = active, name = "autosubsync" })
     menu.on_move = function(_, index) previewed = index; apply_style(index); show_ui() end
     menu.on_select = function(_, index) select_style(index) end
     menu.on_cancel = function() if previewed ~= active then apply_style(active) end end

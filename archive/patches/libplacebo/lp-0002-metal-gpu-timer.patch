@@ -1,0 +1,216 @@
+diff --git a/src/metal/gpu.cc b/src/metal/gpu.cc
+index 98c0ebb..334d2a9 100644
+--- a/src/metal/gpu.cc
++++ b/src/metal/gpu.cc
+@@ -17,9 +17,6 @@
+ 
+ #include "gpu.h"
+ 
+-struct pl_timer_t {
+-    MTL::CommandBuffer *timed_cb; // retained until its GPU time is read
+-};
+ 
+ bool metal_advance_cmd_buffer(struct pl_gpu_metal *p, bool wait)
+ {
+@@ -134,47 +131,74 @@ static bool metal_gpu_is_failed(pl_gpu gpu)
+ 
+ static pl_timer metal_timer_create(pl_gpu gpu)
+ {
+-    (void) gpu;
++    struct pl_gpu_metal *p = (struct pl_gpu_metal *) PL_PRIV(gpu);
++    if (!p->timestamp_counter_set)
++        return NULL;
++
+     struct pl_timer_t *timer = pl_alloc_ptr(NULL, timer);
+     *timer = {};
++
++    metal_autorelease pool;
++    MTL::CounterSampleBufferDescriptor *desc = MTL::CounterSampleBufferDescriptor::alloc()->init();
++    desc->setCounterSet(p->timestamp_counter_set);
++    desc->setSampleCount(PL_METAL_QUERY_COUNT * 2);
++    desc->setStorageMode(MTL::StorageModeShared);
++    NS::Error *err = NULL;
++    timer->sample_buf = p->device->newCounterSampleBuffer(desc, &err);
++    desc->release();
++
++    if (!timer->sample_buf) {
++        pl_free(timer);
++        return NULL;
++    }
++
+     return timer;
+ }
+ 
+ static void metal_timer_destroy(pl_gpu gpu, pl_timer timer)
+ {
+     (void) gpu;
+-    if (timer->timed_cb)
+-        timer->timed_cb->release();
++    if (!timer)
++        return;
++    if (timer->sample_buf)
++        timer->sample_buf->release();
+     pl_free(timer);
+ }
+ 
+-// Reports each timed command buffer once, as soon as the GPU has finished it
+ static uint64_t metal_timer_query(pl_gpu gpu, pl_timer timer)
+ {
+-    (void) gpu;
+-    MTL::CommandBuffer *cb = timer->timed_cb;
+-    if (!cb || cb->status() < MTL::CommandBufferStatusCompleted)
++    struct pl_gpu_metal *p = (struct pl_gpu_metal *) PL_PRIV(gpu);
++    if (!timer || !timer->sample_buf)
++        return 0;
++
++    if (timer->index_read == timer->index_write)
++        return 0;
++
++    int qidx = timer->index_read;
++    uint64_t gen = timer->gen[qidx];
++    if (!metal_gen_completed(p, gen))
+         return 0;
+ 
+-    CFTimeInterval elapsed = cb->GPUEndTime() - cb->GPUStartTime();
+-    cb->release();
+-    timer->timed_cb = NULL;
+-    return elapsed > 0 ? (uint64_t) (elapsed * 1e9) : 1;
++    int sidx = qidx * 2;
++    metal_autorelease pool;
++    NS::Data *data = timer->sample_buf->resolveCounterRange(NS::Range(sidx, 2));
++    timer->index_read = (qidx + 1) % PL_METAL_QUERY_COUNT;
++
++    if (!data)
++        return 1;
++
++    const MTL::CounterResultTimestamp *ts = (const MTL::CounterResultTimestamp *) data->mutableBytes();
++    if (ts[0].timestamp > 0 && ts[1].timestamp > ts[0].timestamp) {
++        return ts[1].timestamp - ts[0].timestamp;
++    }
++
++    return 1;
+ }
+ 
+ void pl_metal_timer_begin(pl_gpu gpu, pl_timer timer)
+ {
+-    struct pl_gpu_metal *p = (struct pl_gpu_metal *) PL_PRIV(gpu);
+-    if (!timer || !p->pending_cb)
+-        return;
+-
+-    // Release any previous timed CB that wasn't collected
+-    if (timer->timed_cb)
+-        timer->timed_cb->release();
+-
+-    // Retain the current pending command buffer for GPU time readback
+-    timer->timed_cb = p->pending_cb;
+-    timer->timed_cb->retain();
++    (void) gpu;
++    (void) timer;
+ }
+ 
+ static void metal_gpu_destroy(pl_gpu gpu)
+@@ -201,6 +225,8 @@ static void metal_gpu_destroy(pl_gpu gpu)
+     if (p->pending_cb)
+         p->pending_cb->release();
+     delete p->cb_failed;
++    if (p->timestamp_counter_set)
++        p->timestamp_counter_set->release();
+     if (p->queue)
+         p->queue->release();
+     if (p->device)
+@@ -301,6 +327,22 @@ pl_gpu pl_gpu_create_metal(struct metal_ctx *ctx)
+     }
+     p->current_gen = 1;
+ 
++    // Timestamp query support
++    p->supports_timestamps = device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary);
++    if (p->supports_timestamps) {
++        NS::Array *counter_sets = device->counterSets();
++        if (counter_sets) {
++            for (NS::UInteger i = 0; i < counter_sets->count(); i++) {
++                MTL::CounterSet *cs = (MTL::CounterSet *) counter_sets->object(i);
++                if (cs->name()->isEqual(MTL::CommonCounterSetTimestamp)) {
++                    p->timestamp_counter_set = cs;
++                    p->timestamp_counter_set->retain();
++                    break;
++                }
++            }
++        }
++    }
++
+     // SPIR-V compiler (needed for GLSL → SPIR-V → MSL pipeline)
+     p->spirv = pl_spirv_create(ctx->log, (struct pl_spirv_version) {
+         .env_version = pl_spirv_version_to_vulkan(spirv_ver),
+diff --git a/src/metal/gpu.h b/src/metal/gpu.h
+index fb35ba6..4a56bbe 100644
+--- a/src/metal/gpu.h
++++ b/src/metal/gpu.h
+@@ -71,6 +71,19 @@ struct pl_gpu_metal {
+ 
+     // Pre-created samplers (same pattern as D3D11 gpu.h:85)
+     MTL::SamplerState *samplers[PL_TEX_SAMPLE_MODE_COUNT][PL_TEX_ADDRESS_MODE_COUNT];
++
++    // Timestamp query support
++    bool supports_timestamps;
++    MTL::CounterSet *timestamp_counter_set;
++};
++
++#define PL_METAL_QUERY_COUNT 32
++
++struct pl_timer_t {
++    MTL::CounterSampleBuffer *sample_buf;
++    uint64_t gen[PL_METAL_QUERY_COUNT];
++    int index_write;
++    int index_read;
+ };
+ 
+ struct pl_buf_metal {
+diff --git a/src/metal/gpu_pass.cc b/src/metal/gpu_pass.cc
+index 74aa3b6..c1a355c 100644
+--- a/src/metal/gpu_pass.cc
++++ b/src/metal/gpu_pass.cc
+@@ -735,6 +735,19 @@ void pl_metal_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+         color->setLoadAction(params->pass->params.load_target ? MTL::LoadActionLoad
+                                                                : MTL::LoadActionDontCare);
+ 
++        if (params->timer && params->timer->sample_buf) {
++            int qidx = params->timer->index_write;
++            int sidx = qidx * 2;
++            auto attach = rp->sampleBufferAttachments()->object((NS::UInteger) 0);
++            attach->setSampleBuffer(params->timer->sample_buf);
++            attach->setStartOfVertexSampleIndex(sidx);
++            attach->setEndOfFragmentSampleIndex(sidx + 1);
++            params->timer->gen[qidx] = p->current_gen;
++            params->timer->index_write = (qidx + 1) % PL_METAL_QUERY_COUNT;
++            if (params->timer->index_write == params->timer->index_read)
++                params->timer->index_read = (params->timer->index_read + 1) % PL_METAL_QUERY_COUNT;
++        }
++
+         MTL::RenderCommandEncoder *enc = cb->renderCommandEncoder(rp);
+         if (!enc) {
+             pass_run_failed(gpu, "render encoder creation");
+@@ -827,7 +840,23 @@ void pl_metal_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+         return;
+     }
+ 
+-    MTL::ComputeCommandEncoder *enc = cb->computeCommandEncoder();
++    MTL::ComputeCommandEncoder *enc = NULL;
++    if (params->timer && params->timer->sample_buf) {
++        int qidx = params->timer->index_write;
++        int sidx = qidx * 2;
++        MTL::ComputePassDescriptor *cp = MTL::ComputePassDescriptor::computePassDescriptor();
++        auto attach = cp->sampleBufferAttachments()->object((NS::UInteger) 0);
++        attach->setSampleBuffer(params->timer->sample_buf);
++        attach->setStartOfEncoderSampleIndex(sidx);
++        attach->setEndOfEncoderSampleIndex(sidx + 1);
++        params->timer->gen[qidx] = p->current_gen;
++        params->timer->index_write = (qidx + 1) % PL_METAL_QUERY_COUNT;
++        if (params->timer->index_write == params->timer->index_read)
++            params->timer->index_read = (params->timer->index_read + 1) % PL_METAL_QUERY_COUNT;
++        enc = cb->computeCommandEncoder(cp);
++    } else {
++        enc = cb->computeCommandEncoder();
++    }
+     if (!enc) {
+         pass_run_failed(gpu, "compute encoder creation");
+         return;

@@ -52,6 +52,30 @@ function normalizeDomainList(list) {
     .filter(Boolean)));
 }
 
+// ---- Settings validation -------------------------------------------------------------
+// Everything below comes from storage or the popup, and ends up in declarativeNetRequest
+// rules. updateSessionRules()/updateDynamicRules() are ATOMIC: one invalid urlFilter makes the
+// whole call fail and every blocking rule silently disappears. The popup autosaves while the
+// user types, so half-typed entries ("||*", a lone "|", non-ASCII) do reach this point.
+const VALID_MODES = ['block', 'capture', 'off'];
+const VALID_TYPES = ['image', 'video', 'audio', 'font', 'subtitle'];
+
+function cleanFilterList(list) {
+  const out = [];
+  for (const raw of (Array.isArray(list) ? list : [])) {
+    if (typeof raw !== 'string') continue;
+    const f = raw.trim();
+    if (!f || f.length > 200) continue;
+    if (!/^[\x21-\x7e]+$/.test(f)) continue;               // printable ASCII, no whitespace
+    if (/^\|{0,2}$/.test(f) || f.startsWith('||*') || f === '*' || f === '^') continue;
+    if (!out.includes(f)) out.push(f);
+  }
+  return out;
+}
+
+const cleanMode = m => (VALID_MODES.includes(m) ? m : null);
+const cleanTypes = t => (Array.isArray(t) ? t.filter(x => VALID_TYPES.includes(x)) : null);
+
 // Registrable domain (eTLD+1). CDNs like av1encodes.com serve manifests from
 // cdn11.av1encodes.com but segments from cdn04.av1encodes.com — recording the
 // exact host would miss the sibling nodes, so we record the eTLD+1.
@@ -521,13 +545,13 @@ chrome.storage.local.get([
   'BLOCK_KEYWORDS',
   'EXCEPTIONS'
 ], result => {
-  if (result.GLOBAL_MODE) GLOBAL_MODE = result.GLOBAL_MODE;
+  if (cleanMode(result.GLOBAL_MODE)) GLOBAL_MODE = result.GLOBAL_MODE;
   if (result.blockingDomains) blockingDomains = normalizeDomainList(result.blockingDomains);
   if (result.nonBlockingDomains) nonBlockingDomains = normalizeDomainList(result.nonBlockingDomains);
   if (result.DISABLED_SITES) DISABLED_SITES = normalizeDomainList(result.DISABLED_SITES);
-  if (result.TYPES) TYPES = Array.isArray(result.TYPES) ? result.TYPES : TYPES;
-  if (result.BLOCK_KEYWORDS) BLOCK_KEYWORDS = Array.isArray(result.BLOCK_KEYWORDS) ? result.BLOCK_KEYWORDS : BLOCK_KEYWORDS;
-  if (result.EXCEPTIONS) EXCEPTIONS = Array.isArray(result.EXCEPTIONS) ? result.EXCEPTIONS : EXCEPTIONS;
+  if (cleanTypes(result.TYPES)) TYPES = cleanTypes(result.TYPES);
+  if (Array.isArray(result.BLOCK_KEYWORDS)) BLOCK_KEYWORDS = cleanFilterList(result.BLOCK_KEYWORDS);
+  if (Array.isArray(result.EXCEPTIONS)) EXCEPTIONS = cleanFilterList(result.EXCEPTIONS);
   dbg('init', { GLOBAL_MODE, blockingDomains, nonBlockingDomains, DISABLED_SITES });
   restoreMediaState(() => {
     resolveStateReady();
@@ -581,6 +605,8 @@ function updateActionBadge(tabId, info) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg !== 'object') return false;
+
   // Current blocking settings (with the worker's defaults applied) for the popup's
   // Blocking tab. Waits for the saved state to load so a cold-started worker doesn't
   // answer with defaults.
@@ -596,11 +622,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'SET_GLOBAL_SETTINGS') {
-    if (msg.globalMode) GLOBAL_MODE = msg.globalMode;
-    if (msg.disabledSites) DISABLED_SITES = normalizeDomainList(msg.disabledSites);
-    if (msg.types) TYPES = Array.isArray(msg.types) ? msg.types : TYPES;
-    if (msg.blockKeywords) BLOCK_KEYWORDS = Array.isArray(msg.blockKeywords) ? msg.blockKeywords : BLOCK_KEYWORDS;
-    if (msg.exceptions) EXCEPTIONS = Array.isArray(msg.exceptions) ? msg.exceptions : EXCEPTIONS;
+    if (cleanMode(msg.globalMode)) GLOBAL_MODE = msg.globalMode;
+    if (Array.isArray(msg.disabledSites)) DISABLED_SITES = normalizeDomainList(msg.disabledSites);
+    if (cleanTypes(msg.types)) TYPES = cleanTypes(msg.types);
+    if (Array.isArray(msg.blockKeywords)) BLOCK_KEYWORDS = cleanFilterList(msg.blockKeywords);
+    if (Array.isArray(msg.exceptions)) EXCEPTIONS = cleanFilterList(msg.exceptions);
 
     chrome.storage.local.set({
       GLOBAL_MODE,
@@ -618,7 +644,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'SET_SITE_MODE') {
     const host = normalizeDomain(msg.host);
     dbg('SET_SITE_MODE', host, msg.mode);
-    if (host) {
+    if (host && (msg.mode === 'block' || msg.mode === 'capture')) {
       if (msg.mode === 'block') {
         nonBlockingDomains = nonBlockingDomains.filter(d => !hostMatches(d, host));
         if (!blockingDomains.some(d => hostMatches(d, host))) blockingDomains.push(host);
@@ -657,16 +683,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.__mbFetchManifest) {
     const target = typeof msg.url === 'string' ? msg.url.trim() : '';
-    if (!target) {
-      sendResponse({ ok: false, error: 'No manifest URL provided' });
+    // Same URL rules as every other launch path (http/https only, one clean token), so a
+    // page can't use a fake "capture" to make the host or this worker fetch file:// or a
+    // string full of control characters.
+    if (!target || !MPV.checkUrl(target).ok) {
+      sendResponse({ ok: false, error: 'No valid manifest URL provided' });
       return false;
     }
+    const mRef = MPV.cleanRef(msg.ref);
 
     const nativeFetch = {
       type: 'FETCH_MANIFEST',
       url: target,
-      ref: typeof msg.ref === 'string' ? msg.ref : '',
-      ua: typeof msg.ua === 'string' ? msg.ua : ''
+      ref: mRef,
+      origin: MPV.originFor(mRef, target),
+      ua: MPV.cleanUa(msg.ua)
     };
 
     chrome.runtime.sendNativeMessage(MPV.HOST, nativeFetch, nativeResponse => {
@@ -681,14 +712,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       (async () => {
         try {
-          const options = { cache: 'no-store', redirect: 'follow', credentials: 'omit' };
-          if (typeof msg.ref === 'string' && /^https?:\/\//i.test(msg.ref)) {
-            options.referrer = msg.ref;
+          const options = { cache: 'no-store', redirect: 'follow', credentials: 'omit', signal: AbortSignal.timeout(15000) };
+          if (mRef) {
+            options.referrer = mRef;
             options.referrerPolicy = 'strict-origin-when-cross-origin';
           }
           const response = await fetch(target, options);
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const text = await response.text();
+          if (text.length > 5e6) throw new Error('Manifest too large');   // a playlist is KBs
           sendResponse({ ok: true, text });
         } catch (error) {
           sendResponse({
@@ -711,7 +743,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.__mbBulkDownload) {
     const items = (Array.isArray(msg.items) ? msg.items : []).filter(it =>
-      it && ((it.file === true && Number.isInteger(it.id)) || (it.req && typeof it.req.url === 'string')));
+      it && ((it.file === true && Number.isInteger(it.id)) || (it.req && typeof it.req.url === 'string')))
+      .slice(0, 500);
     if (!Number.isInteger(msg.tabId) || !items.length) {
       sendResponse({ ok: false, error: 'Nothing to download' });
     } else {
@@ -954,10 +987,28 @@ function bestStreamForTab(tabId) {
   });
 }
 
+// What the right-clicked element is called ({ title, page }), asked of the frame the click
+// happened in (the top frame supplies the page-level video title).
+function menuContext(tabId, frameId) {
+  const ask = fid => new Promise(resolve => {
+    if (!Number.isInteger(tabId) || tabId < 0) return resolve(null);
+    chrome.tabs.sendMessage(tabId, { __mbMenuTitle: true }, { frameId: Number.isInteger(fid) ? fid : 0 }, res => {
+      resolve(chrome.runtime.lastError || !res || !res.ok ? null : res);
+    });
+  });
+  return (async () => {
+    let r = await ask(frameId);
+    if (r && !r.page && frameId) { const top = await ask(0); if (top) r = Object.assign({}, r, { page: top.page }); }
+    return { title: (r && r.title) || '', page: (r && r.page) || '' };
+  })();
+}
+
 async function resolveMenuTarget(info, tab) {
   const isHttp = u => /^https?:\/\//i.test(u || '');
   const pageUrl = info.pageUrl || (tab && tab.url) || '';
-  const title = (tab && tab.title) || 'video';
+  const ctx = await menuContext(tab && tab.id, info.frameId);
+  // The video's own title first; the page's name only as a last resort.
+  const fallback = ctx.page || (tab && tab.title) || 'video';
 
   let url = info.linkUrl || '';
   if (!url && info.selectionText) {
@@ -965,11 +1016,11 @@ async function resolveMenuTarget(info, tab) {
     if (m) url = m[0];
   }
   if (!url && isHttp(info.srcUrl)) url = info.srcUrl;
-  if (url) return { url, ref: pageUrl, title };
+  if (url) return { url, ref: pageUrl, title: ctx.title || fallback };
 
   const stream = tab && (await bestStreamForTab(tab.id));
-  if (stream) return stream;
-  return isHttp(pageUrl) ? { url: pageUrl, title } : null;
+  if (stream) return ctx.title ? Object.assign({}, stream, { title: ctx.title }) : stream;
+  return isHttp(pageUrl) ? { url: pageUrl, title: ctx.page || ctx.title || fallback } : null;
 }
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {

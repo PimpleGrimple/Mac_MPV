@@ -37,9 +37,16 @@
     ['Peacock', /(^|\.)peacocktv\.com$/]
   ];
 
+  const MAX_URL_LEN = 16384;
+
   function checkUrl(urlStr) {
     let url;
-    try { url = new URL(urlStr); } catch (e) {
+    // Anything that ends up in a command line must be one clean token: no whitespace or
+    // control characters (captured URLs are already percent-encoded by the browser).
+    if (typeof urlStr !== 'string' || urlStr.length > MAX_URL_LEN || /[\u0000-\u0020\u007f]/.test(urlStr.trim())) {
+      return { ok: false, reason: 'invalid', message: 'Invalid video URL.' };
+    }
+    try { url = new URL(urlStr.trim()); } catch (e) {
       return { ok: false, reason: 'invalid', message: 'Invalid video URL.' };
     }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
@@ -66,6 +73,72 @@
       .trim()
       .slice(0, 150);
     return s || 'video';
+  }
+
+  // Referer: an http(s) URL as a single clean token, else nothing.
+  function cleanRef(ref) {
+    if (typeof ref !== 'string') return '';
+    const r = ref.trim();
+    if (!r || r.length > 2048 || /[\u0000-\u0020\u007f]/.test(r) || !/^https?:\/\//i.test(r)) return '';
+    return r;
+  }
+
+  // Custom flags: "--" is optional. `volume=70` and `no-keepaspect-window` become
+  // `--volume=70` / `--no-keepaspect-window`; anything already starting with "-" (or a
+  // quote, or a bare number that is a value) is left alone. Quotes keep their spaces.
+  function normalizeFlags(raw) {
+    const text = String(raw || '').slice(0, 4096);
+    const tokens = [];
+    let cur = '', quote = null;
+    for (const ch of text) {
+      if (quote) { cur += ch; if (ch === quote) quote = null; }
+      else if (ch === '"' || ch === "'") { quote = ch; cur += ch; }
+      else if (/\s/.test(ch)) { if (cur) { tokens.push(cur); cur = ''; } }
+      else cur += ch;
+    }
+    if (cur) tokens.push(cur);
+    return tokens
+      .map(t => (/^[-"']/.test(t) || /^\d+(\.\d+)?$/.test(t)) ? t : '--' + t)
+      .join(' ');
+  }
+
+  // Downloads are named from the title, so two different videos with the same title (e.g.
+  // both fall back to the page's name) would overwrite each other. Remember which URL
+  // each title was used for and add " (2)", " (3)"... when a different URL reuses one.
+  // Same URL again -> same name (a retry resumes instead of piling up copies).
+  const NAMES_KEY = 'mbDownloadNames';
+  const NAMES_MAX = 400;
+  async function uniqueDownloadTitle(title, url) {
+    try {
+      const store = await chrome.storage.local.get({ [NAMES_KEY]: {} });
+      const map = store[NAMES_KEY] || {};
+      const key = title.toLowerCase();
+      const list = Array.isArray(map[key]) ? map[key] : [];
+      let i = list.indexOf(url);
+      if (i === -1) { list.push(url); i = list.length - 1; }
+      delete map[key];            // re-insert last so the oldest titles are pruned first
+      map[key] = list.slice(-50);
+      const keys = Object.keys(map);
+      for (let k = 0; k < keys.length - NAMES_MAX; k++) delete map[keys[k]];
+      await chrome.storage.local.set({ [NAMES_KEY]: map });
+      return i === 0 ? title : `${title} (${i + 1})`;
+    } catch (e) {
+      return title;
+    }
+  }
+
+  // User-Agent: printable text only, bounded.
+  function cleanUa(ua) {
+    return String(ua || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 512);
+  }
+
+  // yt-dlp format selector. Everything the extension generates (capFormat, the panel's
+  // rendition picker) fits this alphabet; anything else is refused rather than passed on.
+  const FORMAT_RE = /^[A-Za-z0-9_\-.\[\]<>=!?+\/*,:&|~^()@ ]{1,400}$/;
+  function cleanFormat(fmt) {
+    if (fmt == null || fmt === '') return '';
+    if (typeof fmt !== 'string' || !FORMAT_RE.test(fmt)) throw new Error('Invalid format selector.');
+    return fmt;
   }
 
   function cleanYoutubeUrl(urlStr) {
@@ -125,9 +198,22 @@
       : ok.reduce((best, a) => (a.height < best.height ? a : best));
   }
 
+  // Cross-origin fetch/XHR (what hls.js uses) carries "Origin: <scheme>://<host>" next to the
+  // Referer, and some CDNs 403 without it. It equals the origin of the referring page, so it is
+  // derived from `ref` rather than captured. Same-origin requests don't need it -> ''.
+  function originFor(ref, url) {
+    try {
+      const o = new URL(ref);
+      if (o.protocol !== 'http:' && o.protocol !== 'https:') return '';
+      return o.origin !== new URL(url).origin ? o.origin : '';
+    } catch (e) { return ''; }
+  }
+
   function playFlags(s, req, cap) {
     const f = [];
     if (cap && cap.audioOnly) f.push('--force-window=immediate');
+    const origin = originFor(cleanRef(req.ref), req.url);
+    if (origin && !origin.includes(',')) f.push(`--http-header-fields=Origin:${origin}`);
     if (s.savePosition) f.push('--save-position-on-quit');
     if (s.forceWindow && !f.includes('--force-window=immediate')) f.push('--force-window=immediate');
     if (s.startFromCurrentTime && typeof req.startTime === 'number' && req.startTime > 0) {
@@ -156,7 +242,9 @@
     const chk = checkUrl(req.url);
     if (!chk.ok) throw new Error(chk.message);
 
-    let url = cleanYoutubeUrl(req.url);
+    let url = cleanYoutubeUrl(req.url.trim());
+    const ref = cleanRef(req.ref);
+    const ua = cleanUa(req.ua);
     // Stream and download have their own quality setting.
     const cap = capFormat(action === 'download' ? s.downloadQuality : s.qualityCap);
     // A site that exposes separate files per quality: choose by the same setting. An explicit
@@ -169,14 +257,15 @@
       }
     }
     // An explicit format (a rendition picked in the panel) always beats the cap.
-    const format = req.format || (cap ? cap.format : '');
+    const format = cleanFormat(req.format) || (cap ? cap.format : '');
 
     if (action === 'download') {
       return {
         type: 'DOWNLOAD',
         url,
-        ref: req.ref || '',
-        ua: req.ua || '',
+        ref,
+        origin: originFor(ref, url),
+        ua,
         title: cleanTitle(req.title),
         format,
         ytdlp_path: null
@@ -186,13 +275,14 @@
     return {
       type: 'PLAY',
       url,
-      ref: req.ref || '',
-      ua: req.ua || '',
+      ref,
+      origin: originFor(ref, url),
+      ua,
       title: cleanTitle(req.title),
-      media_type: req.type || '',
+      media_type: /^[a-z]{1,16}$/.test(req.type || '') ? req.type : '',
       format,
       flags: playFlags(s, req, req.format ? null : cap),
-      custom_flags: s.customFlags || '',
+      custom_flags: normalizeFlags(s.customFlags),
       mpv_path: null,
       ytdlp_path: null
     };
@@ -211,10 +301,11 @@
   async function handle(req) {
     const settings = await chrome.storage.local.get(DEFAULTS);
     const msg = buildMessage(req, settings);
+    if (msg.type === 'DOWNLOAD') msg.title = await uniqueDownloadTitle(msg.title, msg.url);
     const res = await native(msg);
     if (!res) return { ok: false, error: 'No response from native host' };
     return { ok: res.ok !== false, error: res.error, response: res };
   }
 
-  root.MPV = { HOST, DEFAULTS, checkUrl, cleanTitle, cleanYoutubeUrl, pickAlt, buildMessage, native, handle };
+  root.MPV = { HOST, DEFAULTS, checkUrl, cleanTitle, normalizeFlags, cleanRef, cleanUa, originFor, cleanYoutubeUrl, pickAlt, buildMessage, native, handle };
 })(self);

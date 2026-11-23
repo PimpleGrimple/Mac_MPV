@@ -2,7 +2,8 @@
   "manifest_version": 3,
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA41EDT5hOT79bLboFHQIVuLiP4LrGIb2ywJiXq5Af6SSxMgwQ9TenPCuGBxko0Gl7Ym8Gcxw3kzPdpnruDtxsOk0LxrNv3Gx0MAhThWuSBzZKM7LMKfpFwj3vZEW43qbd8k1zIwvC61XAWKu+WcAA32mM9IxuFPyOtCWNpQUqnZEMKj8fJSbOxFJXszRWfcVhKOjSj042ev9r3PXTSea42d2LeH4OEQ5gfVTsL8g7BuP64CUl+v8YO/3nThWw0CFm+VcvBhlHPd65Z9mEoGgg5nw5dJzqpmn5RE6B9Oo+AcP9JvvxrPngkFsu+I11hawZtjAkszAYE+hFfXFi4DjlFQIDAQAB",
   "name": "Media Blocker",
-  "version": "3.75",
+  "version": "3.77",
+  "minimum_chrome_version": "110",
   "description": "Blocks stream URLs (m3u8, mp4, etc.) and lists them in the toolbar popup with open-in-mpv and download; one-click Play in MPV for YouTube. No in-page UI.",
   "permissions": [
     "webRequest",

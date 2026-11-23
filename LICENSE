@@ -30,5 +30,6 @@ This configuration repository includes, wraps, and adapts third-party scripts, s
 - **ModernX** (`scripts/modernx.lua`): GNU Lesser General Public License / MIT (zydezu & upstream contributors)
 - **Thumbfast** (`scripts/thumbfast.lua`): GNU General Public License v3.0 (po5)
 - **AutoSubSync** (`scripts/autosubsync/`): MIT License (joaquinteixeira / alass by kaegi)
-- **SponsorBlock** (`scripts/sponsorblock/`): GNU Lesser General Public License v3.0 (po5 & Ajayyy)
+- **Auto Skip Engine** (`scripts/auto_skip/`): MIT / LGPL (incorporates SponsorBlock by po5 & Ajayyy, AniSkip, TheIntroDB, local chapters)
+- **Keybind Visualizer** (`scripts/keybind-visualizer.lua`): MIT License (v-amorim / moonlight-mpv)
 - **Shaders & Presets** (`shaders/`, `luts/`): Respective author licenses (Anime4K by bloc97, ArtCNN by Artoria2e5, FSRCNNX by igv, CuNNy by HelpSeeker, Ravu by bjin, KrigBilateral by Shiandow)

@@ -35,8 +35,8 @@ end
 -- sponsorblock_categories: fetched, skipped and shown as chapters.
 local category_list, labels = {}, {}
 local close = {}
-for c in conf.sponsorblock_categories:gmatch("[^,]+") do
-    c = c:gsub("%s", "")
+for raw_c in conf.sponsorblock_categories:gmatch("[^,]+") do
+    local c = raw_c:gsub("%s", "")
     if c ~= "" and not labels[c] then
         category_list[#category_list + 1] = c
         labels[c] = category_title(c)

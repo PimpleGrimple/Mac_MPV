@@ -1,0 +1,30 @@
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 475af5a..f32168a 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -1915,10 +1915,21 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+ 
+         // Avoid raising saturation excessively when raising brightness, and
+         // also desaturate when reducing brightness greatly to account for the
+-        // reduction in gamut volume.
+-        GLSL("vec2 hull = vec2(i_orig, ipt.x);                  \n"
+-             "hull = ((hull - 6.0) * hull + 9.0) * hull;        \n"
+-             "ipt.yz *= min(i_orig / ipt.x, hull.y / hull.x);   \n");
++        // reduction in gamut volume. Skipped for SDR->HDR inverse tone
++        // mapping (expanding upward): desaturating here washes out color on
++        // the exact case inverse tone mapping is used for. See
++        // https://github.com/haasn/libplacebo/issues/378
++        if (params->inverse_tone_mapping && tone.input_max < tone.output_max) {
++            GLSL("if (i_orig > ipt.x) {                             \n"
++                 "    vec2 hull = vec2(i_orig, ipt.x);              \n"
++                 "    hull = ((hull - 6.0) * hull + 9.0) * hull;    \n"
++                 "    ipt.yz *= min(i_orig / ipt.x, hull.y / hull.x); \n"
++                 "}                                                 \n");
++        } else {
++            GLSL("vec2 hull = vec2(i_orig, ipt.x);                  \n"
++                 "hull = ((hull - 6.0) * hull + 9.0) * hull;        \n"
++                 "ipt.yz *= min(i_orig / ipt.x, hull.y / hull.x);   \n");
++        }
+     }
+ 
+     if (need_gamut_map) {

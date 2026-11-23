@@ -6,9 +6,9 @@
 local mp = require('mp')
 local utils = require('mp.utils')
 local mpopt = require('mp.options')
--- menu_style.lua lives next to this file (or in ~~/script-modules)
-package.path = mp.command_native({ "expand-path", "~~/scripts/autosubsync" }) .. "/?.lua;" .. package.path
-local menu = require('menu_style')
+-- style.lua (the menu) and subtitle.lua live next to this file
+package.path = (mp.get_script_directory() or mp.command_native({ "expand-path", "~~/scripts/autosubsync" })) .. "/?.lua;" .. package.path
+local menu = require('style')
 local sub = require('subtitle')
 local ref_selector
 local engine_selector
@@ -29,9 +29,20 @@ local config = {
     audio_subsync_tool = "ask",
     altsub_subsync_tool = "ask",
 
+    -- Alass tuning options (inspired by moonlight-mpv)
+    -- Split penalty 20 prevents false multi-minute jumps on dubbed or cut audio (alass default is 7)
+    alass_split_penalty = 20,
+    alass_fallback_encoding = "windows-1252",
+    alass_extra_args = "",
+
     -- After retiming, tell mpv to forget the original subtitle track.
     unload_old_sub = true,
 }
+-- The menu's look options (accent_color, bg_alpha, radius, ... see style.lua) live in the same conf and are read by
+-- style.lua; declare them here so mp.options does not warn about them as unknown keys.
+for _, key in ipairs(menu.option_names) do
+    if config[key] == nil then config[key] = "" end
+end
 mpopt.read_options(config, 'autosubsync')
 
 local function is_empty(var)
@@ -39,6 +50,26 @@ local function is_empty(var)
 end
 
 ----- string
+local function is_utf8(path)
+    local file = io.open(path, "rb")
+    if not file then return true end
+    local s = file:read("*a")
+    file:close()
+    local i, n = 1, #s
+    while i <= n do
+        local c = s:byte(i)
+        local extra = c < 0x80 and 0 or (c >= 0xC2 and c <= 0xDF) and 1 or (c >= 0xE0 and c <= 0xEF) and 2
+            or (c >= 0xF0 and c <= 0xF4) and 3 or nil
+        if not extra then return false end
+        for k = i + 1, i + extra do
+            local b = s:byte(k)
+            if not b or b < 0x80 or b > 0xBF then return false end
+        end
+        i = i + extra + 1
+    end
+    return true
+end
+
 local function replace(str, what, with)
     if is_empty(str) then return "" end
     if is_empty(what) then return str end
@@ -272,8 +303,26 @@ local function sync_subtitles(ref_sub_path)
         ret = subprocess(args)
         mp.set_osd_ass(screenx, screeny, "")
     else
+        local args = { config.alass_path }
+        if config.alass_split_penalty and tonumber(config.alass_split_penalty) then
+            table.insert(args, "-p")
+            table.insert(args, tostring(config.alass_split_penalty))
+        end
+        if not is_utf8(subtitle_path) and config.alass_fallback_encoding and config.alass_fallback_encoding ~= "" then
+            table.insert(args, "--encoding-inc")
+            table.insert(args, config.alass_fallback_encoding)
+        end
+        if config.alass_extra_args and config.alass_extra_args ~= "" then
+            for arg in config.alass_extra_args:gmatch("%S+") do
+                table.insert(args, arg)
+            end
+        end
+        table.insert(args, reference_file_path)
+        table.insert(args, subtitle_path)
+        table.insert(args, retimed_subtitle_path)
+
         mp.set_osd_ass(screenx, screeny, "{\\an9}● ")
-        ret = subprocess { config.alass_path, reference_file_path, subtitle_path, retimed_subtitle_path }
+        ret = subprocess(args)
         mp.set_osd_ass(screenx, screeny, "")
     end
 
@@ -348,8 +397,8 @@ end
 ------------------------------------------------------------
 -- Menu actions & bindings
 
--- The look comes from menu_style.lua: the shared style (menu-* script-opts) plus optional per-script overrides, e.g.
---   script-opts-append=autosubsync-menu_accent_color=ff6b71
+-- The look comes from style.lua and is set in autosubsync.conf (accent_color=..., bg_alpha=..., see the list in
+-- style.lua) or by a style profile through autosubsync-<option> script-opts.
 ref_selector = menu:new {
     items = { 'Sync with audio', 'Sync with other subtitles', 'Save current timeline' },
     last_choice = 'audio',
@@ -362,7 +411,7 @@ ref_selector = menu:new {
     },
 }
 
--- Enter / l / click / number key: menu_style.lua closes the menu first, then calls this
+-- Enter / l / click / number key: style.lua closes the menu first, then calls this
 function ref_selector:on_select()
     self:act()
 end

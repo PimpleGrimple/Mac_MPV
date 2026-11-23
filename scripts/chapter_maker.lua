@@ -254,6 +254,8 @@ local function commit_chapters(chapters, keep_undo)
     chapters = normalize_chapters(select_chapters(chapters, false))
     apply_chapters(chapters)
     save_chapters(chapters)
+    local p = media_path() or mp.get_property("path") or ""
+    mp.commandv("script-message", "chapter-maker-updated", p)
 end
 
 -- Reads OGM (CHAPTER01=... / CHAPTER01NAME=...) and simple "HH:MM:SS Title" lines.
@@ -629,6 +631,13 @@ local function embed_chapters()
         -- mkvpropedit exit codes: 0 = ok, 1 = ok with warnings, 2 = error. Failing to start gives status < 0.
         if res and (res.status == 0 or res.status == 1) then
             mp.osd_message(string.format("Embedded %d chapters into the file", #chapters), 3)
+            local cache_p = get_cache_path()
+            if cache_p and utils.file_info(cache_p) then
+                os.remove(cache_p)
+                msg.info("Removed chapter cache after successful embed: " .. cache_p)
+            end
+            local p = media_path() or mp.get_property("path") or ""
+            mp.commandv("script-message", "chapter-maker-updated", p)
         else
             local detail = res and ((res.stderr ~= "" and res.stderr) or (res.stdout ~= "" and res.stdout) or res.error_string)
             msg.error("mkvpropedit failed: " .. tostring(detail))
@@ -664,6 +673,8 @@ mp.register_script_message("create-chapter", split_chapter) -- legacy alias; del
 mp.register_event("file-loaded", function()
     cancel_active_prompt() -- a prompt opened on the previous file has no business surviving a file change
     load_chapters()
+    local p = media_path() or mp.get_property("path") or ""
+    mp.commandv("script-message", "chapter-maker-ready", p)
 end)
 mp.register_event("end-file", function()
     cancel_active_prompt()

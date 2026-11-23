@@ -1,0 +1,420 @@
+diff --git a/meson.build b/meson.build
+index fb10be5..0802903 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1636,10 +1636,13 @@ if features['macos-cocoa-cb']
+                            'video/out/cocoa_cb_common.swift',
+                            'video/out/mac/gl_layer.swift')
+ endif
+-if features['cocoa'] and features['vulkan'] and features['swift']
+-    swift_sources += files('video/out/mac_common.swift',
+-                           'video/out/mac/metal_layer.swift')
+-    sources += files('video/out/vulkan/context_mac.m')
++if features['cocoa'] and features['swift']
++    if features['vulkan']
++        swift_sources += files('video/out/mac_common.swift',
++                               'video/out/mac/metal_layer.swift')
++        sources += files('video/out/vulkan/context_mac.m')
++    endif
++    sources += files('video/out/metal/context_mac.m')
+ endif
+ 
+ macos_media_player = get_option('macos-media-player').require(
+diff --git a/video/out/gpu/context.c b/video/out/gpu/context.c
+index 60c0641..35b50e5 100644
+--- a/video/out/gpu/context.c
++++ b/video/out/gpu/context.c
+@@ -54,6 +54,11 @@ extern const struct ra_ctx_fns ra_ctx_vulkan_mac;
+ /* Direct3D 11 */
+ extern const struct ra_ctx_fns ra_ctx_d3d11;
+ 
++/* Metal */
++#if HAVE_COCOA && HAVE_SWIFT
++extern const struct ra_ctx_fns ra_ctx_metal_mac;
++#endif
++
+ /* No API */
+ extern const struct ra_ctx_fns ra_ctx_wldmabuf;
+ 
+@@ -82,6 +87,11 @@ static const struct ra_ctx_fns *const contexts[] = {
+     &ra_ctx_d3d11,
+ #endif
+ 
++// Metal contexts:
++#if HAVE_COCOA && HAVE_SWIFT
++    &ra_ctx_metal_mac,
++#endif
++
+ // Vulkan contexts:
+ #if HAVE_VULKAN
+ #if HAVE_WIN32_DESKTOP
+diff --git a/video/out/gpu_next/context.c b/video/out/gpu_next/context.c
+index 2c7c9fa..7e8daa7 100644
+--- a/video/out/gpu_next/context.c
++++ b/video/out/gpu_next/context.c
+@@ -50,6 +50,10 @@
+ #include "video/out/vulkan/context.h"
+ #endif
+ 
++#if HAVE_COCOA && HAVE_SWIFT
++#include "video/out/metal/context.h"
++#endif
++
+ #if HAVE_D3D11
+ static bool d3d11_pl_init(struct vo *vo, struct gpu_ctx *ctx,
+                           struct ra_ctx_opts *ctx_opts)
+@@ -115,6 +119,16 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
+     if (!ctx->ra_ctx)
+         goto err_out;
+ 
++#if HAVE_COCOA && HAVE_SWIFT
++    struct mpmetal_ctx *metalctx = ra_metal_ctx_get(ctx->ra_ctx);
++    if (metalctx) {
++        ctx->pllog = metalctx->pllog;
++        ctx->gpu = metalctx->gpu;
++        ctx->swapchain = metalctx->swapchain;
++        return ctx;
++    }
++#endif
++
+ #if HAVE_VULKAN
+     struct mpvk_ctx *vkctx = ra_vk_ctx_get(ctx->ra_ctx);
+     if (vkctx) {
+@@ -183,6 +197,10 @@ err_out:
+ 
+ bool gpu_ctx_resize(struct gpu_ctx *ctx, int w, int h)
+ {
++#if HAVE_COCOA && HAVE_SWIFT
++    if (ra_metal_ctx_get(ctx->ra_ctx))
++        return true;
++#endif
+ #if HAVE_VULKAN
+     if (ra_vk_ctx_get(ctx->ra_ctx))
+         // vulkan RA handles this by itself
+@@ -200,6 +218,11 @@ void gpu_ctx_destroy(struct gpu_ctx **ctxp)
+     if (!ctx->ra_ctx)
+         goto skip_common_pl_cleanup;
+ 
++#if HAVE_COCOA && HAVE_SWIFT
++    if (ra_metal_ctx_get(ctx->ra_ctx))
++        goto skip_common_pl_cleanup;
++#endif
++
+ #if HAVE_VULKAN
+     if (ra_vk_ctx_get(ctx->ra_ctx))
+         // vulkan RA context handles pl cleanup by itself,
+diff --git a/video/out/metal/context.h b/video/out/metal/context.h
+new file mode 100644
+index 0000000..02d40f3
+--- /dev/null
++++ b/video/out/metal/context.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <libplacebo/config.h>
++#ifdef PL_HAVE_METAL
++#include <libplacebo/metal.h>
++#endif
++
++#include "video/out/gpu/context.h"
++
++struct mpmetal_ctx {
++    pl_log pllog;
++#ifdef PL_HAVE_METAL
++    pl_metal metal;
++#else
++    void *metal;
++#endif
++    pl_gpu gpu;
++    pl_swapchain swapchain;
++};
++
++struct mpmetal_ctx *ra_metal_ctx_get(struct ra_ctx *ctx);
+diff --git a/video/out/metal/context_mac.m b/video/out/metal/context_mac.m
+new file mode 100644
+index 0000000..191250c
+--- /dev/null
++++ b/video/out/metal/context_mac.m
+@@ -0,0 +1,282 @@
++#import <QuartzCore/QuartzCore.h>
++#import <Metal/Metal.h>
++
++#include <libplacebo/config.h>
++#ifdef PL_HAVE_METAL
++#include <libplacebo/metal.h>
++#endif
++
++#include "video/out/gpu/context.h"
++#include "video/out/placebo/ra_pl.h"
++#include "video/out/placebo/utils.h"
++#include "osdep/mac/swift.h"
++
++#include "context.h"
++
++struct priv {
++    struct mpmetal_ctx metal;
++    MacCommon *vo_mac;
++    struct ra_ctx_params params;
++    struct ra_tex proxy_tex;
++};
++
++static const struct ra_swapchain_fns metal_swapchain;
++
++struct mpmetal_ctx *ra_metal_ctx_get(struct ra_ctx *ctx)
++{
++    if (!ctx || !ctx->swapchain || ctx->swapchain->fns != &metal_swapchain)
++        return NULL;
++    struct priv *p = ctx->swapchain->priv;
++    return &p->metal;
++}
++
++static void mac_metal_uninit(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    if (!p)
++        return;
++
++#ifdef PL_HAVE_METAL
++    if (ctx->swapchain) {
++        if (ctx->ra) {
++            if (p->metal.gpu)
++                pl_gpu_finish(p->metal.gpu);
++            if (p->metal.swapchain)
++                pl_swapchain_destroy(&p->metal.swapchain);
++            ctx->ra->fns->destroy(ctx->ra);
++            ctx->ra = NULL;
++        }
++        if (p->metal.metal)
++            pl_metal_destroy(&p->metal.metal);
++        p->metal.gpu = NULL;
++        TA_FREEP(&ctx->swapchain);
++    } else if (p->metal.metal) {
++        pl_metal_destroy(&p->metal.metal);
++    }
++#endif
++
++    if (p->metal.pllog)
++        pl_log_destroy(&p->metal.pllog);
++
++    if (p->vo_mac)
++        [p->vo_mac uninit:ctx->vo];
++}
++
++static void mac_metal_swap_buffers(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    [p->vo_mac swapBuffer];
++}
++
++static void mac_metal_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
++{
++    struct priv *p = ctx->priv;
++    [p->vo_mac fillVsyncWithInfo:info];
++}
++
++static int mac_metal_color_depth(struct ra_ctx *ctx)
++{
++    return 0;
++}
++
++static bool mac_metal_check_visible(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    return [p->vo_mac isVisible];
++}
++
++static int color_depth(struct ra_swapchain *sw)
++{
++    struct priv *p = sw->priv;
++    if (p->params.color_depth)
++        return p->params.color_depth(sw->ctx);
++    return -1;
++}
++
++static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
++{
++    struct priv *p = sw->priv;
++    struct pl_swapchain_frame frame;
++
++    bool visible = true;
++    if (p->params.check_visible)
++        visible = p->params.check_visible(sw->ctx);
++
++    if (out_fbo == NULL || !visible)
++        return visible;
++
++    if (!pl_swapchain_start_frame(p->metal.swapchain, &frame))
++        return false;
++    if (!mppl_wrap_tex(sw->ctx->ra, frame.fbo, &p->proxy_tex))
++        return false;
++
++    *out_fbo = (struct ra_fbo) {
++        .tex = &p->proxy_tex,
++        .flip = frame.flipped,
++    };
++
++    return true;
++}
++
++static bool submit_frame(struct ra_swapchain *sw, const struct vo_frame *frame)
++{
++    struct priv *p = sw->priv;
++    return pl_swapchain_submit_frame(p->metal.swapchain);
++}
++
++static void swap_buffers(struct ra_swapchain *sw)
++{
++    struct priv *p = sw->priv;
++    pl_swapchain_swap_buffers(p->metal.swapchain);
++    if (p->params.swap_buffers)
++        p->params.swap_buffers(sw->ctx);
++}
++
++static void get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
++{
++    struct priv *p = sw->priv;
++    if (p->params.get_vsync)
++        p->params.get_vsync(sw->ctx, info);
++}
++
++static pl_color_space_t target_csp(struct ra_swapchain *sw)
++{
++    struct priv *p = sw->priv;
++    if (p->params.preferred_csp)
++        return p->params.preferred_csp(sw->ctx);
++    return (pl_color_space_t){0};
++}
++
++static const struct ra_swapchain_fns metal_swapchain = {
++    .color_depth   = color_depth,
++    .target_csp    = target_csp,
++    .start_frame   = start_frame,
++    .submit_frame  = submit_frame,
++    .swap_buffers  = swap_buffers,
++    .get_vsync     = get_vsync,
++};
++
++static bool resize(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++
++    if (!p->vo_mac.window)
++        return false;
++
++    CGSize size = p->vo_mac.window.framePixel.size;
++    int w = (int)size.width;
++    int h = (int)size.height;
++
++    bool ok = pl_swapchain_resize(p->metal.swapchain, &w, &h);
++    ctx->vo->dwidth = w;
++    ctx->vo->dheight = h;
++    return ok;
++}
++
++static bool mac_metal_reconfig(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    if (![p->vo_mac config:ctx->vo])
++        return false;
++
++    [p->vo_mac updateWithAlpha:ctx->opts.want_alpha];
++
++    if (!resize(ctx))
++        return false;
++
++    return true;
++}
++
++static void mac_metal_update_render_opts(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    [p->vo_mac updateWithAlpha:ctx->opts.want_alpha];
++}
++
++static int mac_metal_control(struct ra_ctx *ctx, int *events, int request, void *arg)
++{
++    struct priv *p = ctx->priv;
++    int ret = [p->vo_mac control:ctx->vo events:events request:request data:arg];
++
++    if (*events & VO_EVENT_RESIZE) {
++        if (!resize(ctx))
++            return VO_ERROR;
++    }
++
++    return ret;
++}
++
++static bool mac_metal_init(struct ra_ctx *ctx)
++{
++#ifndef PL_HAVE_METAL
++    MP_ERR(ctx, "libplacebo was built without Metal support.\n");
++    return false;
++#else
++    int msgl = ctx->opts.probing ? MSGL_V : MSGL_ERR;
++
++    if (!NSApp) {
++        MP_MSG(ctx, msgl, "Failed to initialize macmetal context, no NSApplication initialized.\n");
++        return false;
++    }
++
++    struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
++    p->metal.pllog = mppl_log_create(ctx, ctx->log);
++    if (!p->metal.pllog)
++        return false;
++
++    mppl_log_set_probing(p->metal.pllog, ctx->opts.probing);
++
++    p->metal.metal = pl_metal_create(p->metal.pllog, NULL);
++    if (!p->metal.metal) {
++        MP_MSG(ctx, msgl, "Failed to create libplacebo Metal device\n");
++        goto error;
++    }
++    p->metal.gpu = p->metal.metal->gpu;
++
++    p->vo_mac = [[MacCommon alloc] init:ctx->vo];
++    if (!p->vo_mac)
++        goto error;
++
++    struct ra_swapchain *sw = ctx->swapchain = talloc_zero(NULL, struct ra_swapchain);
++    sw->ctx = ctx;
++    sw->fns = &metal_swapchain;
++    sw->priv = p;
++
++    p->params = (struct ra_ctx_params) {
++        .swap_buffers = mac_metal_swap_buffers,
++        .get_vsync = mac_metal_get_vsync,
++        .color_depth = mac_metal_color_depth,
++        .check_visible = mac_metal_check_visible,
++    };
++
++    ctx->ra = ra_create_pl(p->metal.gpu, ctx->log);
++    if (!ctx->ra)
++        goto error;
++
++    p->metal.swapchain = pl_metal_create_swapchain(p->metal.metal,
++        pl_metal_swapchain_params(
++            .layer = (__bridge void *)p->vo_mac.layer,
++        ));
++    if (!p->metal.swapchain) {
++        MP_MSG(ctx, msgl, "Failed to create libplacebo Metal swapchain\n");
++        goto error;
++    }
++
++    return true;
++
++error:
++    mac_metal_uninit(ctx);
++    return false;
++#endif
++}
++
++const struct ra_ctx_fns ra_ctx_metal_mac = {
++    .type               = "metal",
++    .name               = "mac",
++    .description        = "mac/Metal (native)",
++    .reconfig           = mac_metal_reconfig,
++    .control            = mac_metal_control,
++    .update_render_opts = mac_metal_update_render_opts,
++    .init               = mac_metal_init,
++    .uninit             = mac_metal_uninit,
++};
