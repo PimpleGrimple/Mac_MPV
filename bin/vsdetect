@@ -1,0 +1,365 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════
+# vsdetect — Cadence and media scanner backend for vsprocess
+# ═══════════════════════════════════════════════════════════
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: vsdetect <input-file> [--fast] [--json] [--scan-hd]" >&2
+    exit 2
+fi
+
+INPUT="$1"
+FAST_MODE=0
+JSON_MODE=0
+SCAN_HD=0
+shift
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fast) FAST_MODE=1 ;;
+        --json) JSON_MODE=1 ;;
+        --scan-hd) SCAN_HD=1 ;;
+    esac
+    shift
+done
+
+FFPROBE="${FFPROBE:-ffprobe}"
+FFMPEG="${FFMPEG:-ffmpeg}"
+export FFPROBE FFMPEG
+
+if [ ! -f "$INPUT" ]; then echo "ERROR: Input not found" >&2; exit 1; fi
+
+PROBE=$("$FFPROBE" -v quiet -print_format json -show_streams -show_format -i "$INPUT" 2>/dev/null)
+if [ -z "$PROBE" ]; then echo "ERROR: ffprobe failed" >&2; exit 1; fi
+
+METADATA=$(printf '%s' "$PROBE" | python3 -c '
+import json, sys
+try:
+    probe = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+vs = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), None)
+if vs is None:
+    print("NO_VIDEO")
+    sys.exit(0)
+fmt = probe.get("format", {})
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+print(" ".join(str(x) for x in (
+    vs.get("width", 0), vs.get("height", 0), vs.get("codec_name", "unknown"),
+    vs.get("r_frame_rate", "0/1"), vs.get("field_order", "unknown"),
+    vs.get("sample_aspect_ratio", "1:1"), safe_float(fmt.get("duration")),
+    vs.get("avg_frame_rate", "0/1")
+)))
+') || { echo "ERROR: Could not parse ffprobe output" >&2; exit 1; }
+if [ "$METADATA" = "NO_VIDEO" ]; then echo "ERROR: No video stream found" >&2; exit 1; fi
+if [ -z "$METADATA" ]; then echo "ERROR: No video metadata found" >&2; exit 1; fi
+read -r WIDTH HEIGHT CODEC FPS_R FO SAR DURATION AVG_FPS_R <<< "$METADATA"
+
+FPS_FLOAT=$(python3 - "$FPS_R" <<'PYEOF'
+import sys
+try:
+    n, d = map(int, sys.argv[1].split("/", 1))
+    print(f"{n / d:.3f}" if d else "0.000")
+except Exception:
+    print("0.000")
+PYEOF
+)
+AVG_FPS_FLOAT=$(python3 - "$AVG_FPS_R" <<'PYEOF'
+import sys
+try:
+    n, d = map(int, sys.argv[1].split("/", 1))
+    print(f"{n / d:.3f}" if d else "0.000")
+except Exception:
+    print("0.000")
+PYEOF
+)
+
+# Helper: emit results (pipe-delimited or JSON).
+# Pass values as arguments rather than interpolating media metadata into Python source.
+_emit() {
+    local detection="$1"
+    local status dfo i_ratio p_ratio rep_ratio
+    IFS='|' read -r status dfo i_ratio p_ratio rep_ratio <<< "$detection"
+    if [ "$JSON_MODE" -eq 1 ]; then
+        python3 - "$WIDTH" "$HEIGHT" "$CODEC" "$FPS_R" "$FPS_FLOAT" "$FO" "$SAR" "$DURATION" \
+            "$status" "$dfo" "${i_ratio:-0}" "${p_ratio:-0}" "${rep_ratio:-0}" <<'PYEOF'
+import json, sys
+
+def integer(value):
+    try: return int(value)
+    except (TypeError, ValueError): return 0
+
+def number(value):
+    try: return float(value)
+    except (TypeError, ValueError): return 0.0
+
+(width, height, codec, fps_r, fps, field_order, sar, duration,
+ status, detected_fo, i_ratio, p_ratio, rep_ratio) = sys.argv[1:14]
+print(json.dumps({
+    "width": integer(width), "height": integer(height), "codec": codec,
+    "fps_r": fps_r, "fps": number(fps), "field_order": field_order,
+    "sar": sar, "duration": number(duration), "status": status,
+    "detected_fo": detected_fo, "i_ratio": number(i_ratio),
+    "p_ratio": number(p_ratio), "rep_ratio": number(rep_ratio),
+}, indent=2))
+PYEOF
+    else
+        echo "$WIDTH|$HEIGHT|$CODEC|$FPS_R|$FPS_FLOAT|$FO|$SAR|$DURATION|$detection"
+    fi
+}
+
+# FFprobe's field-order tags vary by container/codec. Convert the values used
+# by the HD metadata shortcut to the tff/bff vocabulary consumed by the filters.
+normalize_field_order() {
+    case "$1" in
+        tff|tt|tb) echo "tff" ;;
+        bff|bb|bt) echo "bff" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+if [ "$FAST_MODE" -eq 1 ]; then
+    _emit "unknown|unknown|0.000|0.000|0.000"
+    exit 0
+fi
+
+# ── Cheap pre-checks (no idet pass needed) ──────────────────────────────────────
+# HD content is almost never DVD-era telecine. However, if ffprobe already reports
+# an interlaced field_order (tt/bb/tb/bt), trust that and skip the scan.
+if { [ "$WIDTH" -gt 720 ] || [ "$HEIGHT" -gt 576 ]; } && [ "$SCAN_HD" -eq 0 ]; then
+    if [[ "$FO" == "tt" || "$FO" == "tb" || "$FO" == "bt" || "$FO" == "bb" ]]; then
+        local_order=$(normalize_field_order "$FO")
+        echo "  ${WIDTH}x${HEIGHT} is HD with interlaced field_order=$FO — using metadata ($local_order)" >&2
+        _emit "interlaced|$local_order|0.000|0.000|0.000"
+    elif [ "$FO" = "progressive" ]; then
+        echo "  ${WIDTH}x${HEIGHT} is HD with progressive metadata (skipping idet; use --scan-hd to inspect)" >&2
+        _emit "progressive|unknown|0.000|0.000|0.000"
+    else
+        echo "  ${WIDTH}x${HEIGHT} has unknown HD field-order metadata (skipping idet; use --scan-hd to inspect)" >&2
+        _emit "unknown|unknown|0.000|0.000|0.000"
+    fi
+    exit 0
+fi
+
+# Soft telecine — method 1: avg_frame_rate differs from r_frame_rate
+# (only works when the container exposes the correct avg_frame_rate)
+SOFT_TELECINE=$(python3 -c "
+r=$FPS_FLOAT; a=$AVG_FPS_FLOAT
+print('1' if abs(r-29.97)<0.1 and abs(a-23.976)<0.1 else '0')
+")
+if [ "$SOFT_TELECINE" == "1" ]; then
+    echo "  Soft telecine (avg_fps≈23.976): r_fps=$FPS_FLOAT avg_fps=$AVG_FPS_FLOAT" >&2
+    _emit "telecine|$FO|0.000|0.000|0.000"
+    exit 0
+fi
+
+# Soft telecine — method 2: per-frame repeat_pict scan
+# ffprobe avg_frame_rate reports 29.97 even for rff-based telecine because it
+# counts container frames, not display timing. The ground truth is the
+# repeat_pict flag set by MPEG-2 and similar telecine-capable codecs.
+# Standard 3:2 pulldown commonly marks roughly 40% of frames with a repeat flag.
+# Threshold: ≥30% flagged frames with <10% genuinely interlaced = soft telecine.
+RFF_RESULT=$(python3 - "$INPUT" << 'RFFEOF'
+import sys, subprocess, json, os
+
+src = sys.argv[1]
+cmd = [os.environ.get("FFPROBE", "ffprobe"), "-v", "error", "-select_streams", "v:0",
+       "-show_frames", "-read_intervals", "%+#300",
+       "-show_entries", "frame=repeat_pict,interlaced_frame",
+       "-of", "json", "-i", src]
+try:
+    out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=15)
+    frames = json.loads(out).get("frames", [])
+except Exception:
+    print("0 0 0"); sys.exit(0)
+
+total = len(frames)
+if total == 0:
+    print("0 0 0"); sys.exit(0)
+
+# Any positive repeat_pict value signals extra display fields; count the
+# affected frames rather than counting only the common value of exactly 1.
+rff   = sum(1 for f in frames if int(f.get("repeat_pict", 0) or 0) > 0)
+intl  = sum(1 for f in frames if f.get("interlaced_frame", 0) == 1)
+print(f"{total} {rff} {intl}")
+RFFEOF
+)
+
+RFF_TOTAL=$(echo "$RFF_RESULT" | awk '{print $1}')
+RFF_COUNT=$(echo "$RFF_RESULT" | awk '{print $2}')
+RFF_INTL=$(echo "$RFF_RESULT" | awk '{print $3}')
+
+if [ "${RFF_TOTAL:-0}" -gt 0 ]; then
+    IS_SOFT_TC=$(python3 -c "
+total=$RFF_TOTAL; rff=$RFF_COUNT; intl=$RFF_INTL
+rff_r  = rff  / total
+intl_r = intl / total
+# ≥30% rff + <10% genuinely interlaced = rff-based soft telecine
+print('1' if rff_r >= 0.30 and intl_r < 0.10 else '0')
+")
+    if [ "$IS_SOFT_TC" == "1" ]; then
+        RFF_PCT=$(python3 -c "print(f'{$RFF_COUNT*100/$RFF_TOTAL:.0f}')")
+        echo "  Soft telecine (repeat flags): ${RFF_COUNT}/${RFF_TOTAL} frames have repeat_pict>0 (${RFF_PCT}%)" >&2
+        _emit "telecine|$FO|0.000|0.000|0.000"
+        exit 0
+    fi
+fi
+
+echo "  Scanning cadence (3-point idet)..." >&2
+DETECTION=$(python3 - "$INPUT" "$DURATION" "$CODEC" "$FPS_FLOAT" << 'PYEOF'
+import subprocess, re, sys, os
+
+ffmpeg = os.environ.get("FFMPEG", "ffmpeg")
+src    = sys.argv[1]
+dur    = float(sys.argv[2]) if sys.argv[2] else 0
+frames = 150
+
+# Sample multiple points only when the file is long enough relative to the
+# actual frame rate. This avoids overlapping sample windows on high/low-fps files.
+try:
+    sample_fps = float(sys.argv[4])
+except (TypeError, ValueError):
+    sample_fps = 24.0
+if sample_fps <= 0:
+    sample_fps = 24.0
+sample_duration = frames / sample_fps
+if dur > sample_duration * 3.5:
+    offsets = [dur * 0.10, dur * 0.50, dur * 0.80]
+else:
+    offsets = [0.0]
+
+def idet(offset, n):
+    cmd = [ffmpeg, "-v", "level+verbose"]
+    if offset > 0:
+        cmd += ["-ss", f"{offset:.1f}"]
+    cmd += ["-i", src, "-vf", "idet", "-frames:v", str(n), "-an", "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception:
+        return None
+    err = r.stderr
+    res = dict(tff=0, bff=0, progressive=0, undetermined=0, total=0,
+               rep_top=0, rep_bot=0, rep_neither=0)
+    m = re.findall(r"Repeated Fields:\s+Neither:\s*(\d+)\s+Top:\s*(\d+)\s+Bottom:\s*(\d+)", err)
+    if m:
+        nei, top, bot = map(int, m[-1])
+        res.update(rep_neither=nei, rep_top=top, rep_bot=bot)
+    for label in ("Multi frame detection", "Single frame detection"):
+        m2 = re.findall(re.escape(label) + r":\s+TFF:\s*(\d+)\s+BFF:\s*(\d+)\s+Progressive:\s*(\d+)\s+Undetermined:\s*(\d+)", err)
+        if m2:
+            tff, bff, prog, und = map(int, m2[-1])
+            res.update(tff=tff, bff=bff, progressive=prog, undetermined=und, total=tff+bff+prog+und)
+            break
+    return res
+
+samples = [idet(o, frames) for o in offsets]
+valid   = [s for s in samples if s and s["total"] > 0]
+if not valid:
+    print("unknown|unknown|0.000|0.000|0.000")
+    sys.exit()
+
+agg       = {k: sum(s[k] for s in valid) for k in valid[0]}
+total     = agg["total"]
+i_ratio   = (agg["tff"] + agg["bff"]) / total
+p_ratio   = agg["progressive"] / total
+rep_total = agg["rep_top"] + agg["rep_bot"] + agg["rep_neither"]
+rep_ratio = (agg["rep_top"] + agg["rep_bot"]) / rep_total if rep_total else 0.0
+if agg["tff"] > agg["bff"]:
+    fo_str = "tff"
+elif agg["bff"] > agg["tff"]:
+    fo_str = "bff"
+else:
+    fo_str = "unknown"
+
+codec = sys.argv[3].lower()
+fps   = float(sys.argv[4])
+# Relative tolerance (~0.3 fps at 29.97) instead of a fixed 0.1 fps window —
+# catches container fps values that drift slightly off exact NTSC rate.
+ntsc = "mpeg2" in codec and fps > 0 and abs(fps - 29.97) / 29.97 < 0.01
+
+DECISIVE_I       = 0.85
+TELECINE_T       = 0.20
+INTERLACED_T     = 0.20
+REP_TELECINE_MIN = 0.04
+MIXED_VARIANCE_T = 0.35
+PROG_BIAS        = 0.55
+
+status = None
+
+# Decisive check BEFORE variance: a single stray sample (scene change,
+# black frames, etc.) shouldn't downgrade an otherwise unambiguous
+# interlaced/telecine aggregate into a false "mix".
+if i_ratio >= DECISIVE_I and p_ratio <= 0.10:
+    if ntsc:
+        i_tot = agg["tff"] + agg["bff"]
+        dom = (agg["tff"]/i_tot >= 0.85 or agg["bff"]/i_tot >= 0.85) if i_tot else False
+        status = "telecine" if (dom and rep_ratio >= REP_TELECINE_MIN and p_ratio > 0.05) else "interlaced"
+    else:
+        status = "interlaced"
+
+# Variance check — only matters when the aggregate itself is ambiguous.
+# Genuine mixed content shows up as one sample nearly all-progressive and
+# another nearly all-interlaced; a telecine source with ordinary scene
+# changes does not, so it falls through to the ratio checks below instead.
+if status is None:
+    i_ratios = [(s["tff"]+s["bff"])/s["total"] for s in valid]
+    p_ratios = [s["progressive"]/s["total"] for s in valid]
+    if len(valid) >= 2 and (max(i_ratios) - min(i_ratios)) >= MIXED_VARIANCE_T:
+        if min(p_ratios) < 0.10:
+            # A real pulldown pattern (rep_ratio) means TFM has genuine
+            # duplicate fields to lock onto, so its VFR timecodes can be
+            # trusted. Without one, the "mixed" content is likely just
+            # majority-interlaced with an isolated telecine/progressive
+            # blip (or vice versa) — TFM's field-match decisions on the
+            # interlaced portion are noise, and TDecimate's vfrDec=1
+            # timecodes built from that noise drift out of sync.
+            status = "mix_telecine" if rep_ratio >= REP_TELECINE_MIN else "mix_interlaced"
+
+if status is None and ntsc and (agg["tff"] + agg["bff"]) > 0:
+    i_tot = agg["tff"] + agg["bff"]
+    dom = (agg["tff"]/i_tot >= 0.85 or agg["bff"]/i_tot >= 0.85) if i_tot else False
+    if dom:
+        if rep_ratio >= REP_TELECINE_MIN and p_ratio > 0.05:
+            status = "telecine"
+        elif p_ratio <= 0.05:
+            status = "interlaced"
+
+if status is None:
+    if i_ratio >= TELECINE_T and p_ratio >= TELECINE_T:
+        status = "mix_telecine" if rep_ratio >= REP_TELECINE_MIN else "mix_interlaced"
+    elif i_ratio >= INTERLACED_T:
+        status = "interlaced"
+    elif p_ratio >= (1 - INTERLACED_T):
+        status = "progressive"
+    elif p_ratio >= PROG_BIAS:
+        status = "progressive"
+
+if status is None:
+    status = "unknown"
+
+print(f"{status}|{fo_str}|{i_ratio:.3f}|{p_ratio:.3f}|{rep_ratio:.3f}")
+PYEOF
+)
+
+# Container field_order fallback — only reached when idet itself is inconclusive.
+STATUS_ONLY=$(echo "$DETECTION" | cut -d'|' -f1)
+if [ "$STATUS_ONLY" = "unknown" ]; then
+    IFS='|' read -r _ DETECTED_FO I_RATIO P_RATIO REP_RATIO <<< "$DETECTION"
+    case "$FO" in
+        progressive) FALLBACK_STATUS="progressive"; FALLBACK_FO="unknown" ;;
+        tt|tb|tff)   FALLBACK_STATUS="interlaced"; FALLBACK_FO="tff" ;;
+        bb|bt|bff)   FALLBACK_STATUS="interlaced"; FALLBACK_FO="bff" ;;
+        *)           FALLBACK_STATUS="unknown"; FALLBACK_FO="unknown" ;;
+    esac
+    if [ "$FALLBACK_STATUS" != "unknown" ]; then
+        DETECTION="$FALLBACK_STATUS|$FALLBACK_FO|${I_RATIO:-0.000}|${P_RATIO:-0.000}|${REP_RATIO:-0.000}"
+        echo "  idet inconclusive, falling back to container field_order=$FO" >&2
+    fi
+fi
+
+_emit "$DETECTION"
